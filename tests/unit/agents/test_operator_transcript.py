@@ -32,7 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from artemis.agents.operator.operator import OperatorNode
+from artemis.agents.operator.operator import _NO_TOOL_CALL_NOTICE, OperatorNode
 from artemis.agents.operator.prompts import load_operator_prompts
 from artemis.agents.operator.prompts import (
     PLAN_HISTORY_STATIC_POINTER,
@@ -139,13 +139,22 @@ def _transcript_state(**overrides):
 
 
 def _no_action_llm(captured: list):
+    """A model that never calls a tool, capturing one prompt per turn.
+
+    A tool-less response is nudged and retried once, so each turn reaches the
+    model twice. Only the first invocation carries the prompt the node built;
+    the retry just appends the nudge to it. Capturing only the former keeps
+    ``captured[n]`` meaning "the prompt for turn n".
+    """
     mock_llm = MagicMock()
     mock_response = MagicMock()
     mock_response.tool_calls = []
     mock_response.content = "no action this turn"
 
     async def mock_ainvoke(*args, **kwargs):
-        captured.append(list(args[0]))
+        messages = list(args[0])
+        if _NO_TOOL_CALL_NOTICE not in str(messages[-1].content):
+            captured.append(messages)
         return mock_response
 
     mock_llm.ainvoke = AsyncMock(side_effect=mock_ainvoke)
@@ -297,3 +306,39 @@ async def test_flag_off_keeps_legacy_two_message_build_and_no_ledger():
     assert isinstance(captured[0][0], SystemMessage)
     assert isinstance(captured[0][1], HumanMessage)
     assert ctx.transcript_ledger is None
+
+
+@pytest.mark.asyncio
+async def test_tool_less_turn_is_nudged_once_before_yielding():
+    """A turn with no tool calls gets one in-loop nudge, not a whole graph lap.
+
+    Pro used to log "Encouraging action." and encourage nothing: it abandoned
+    the turn, and the graph paid a full lap -- convergence, perception, a fresh
+    screenshot and UI tree -- to ask the same question again. The nudge has to
+    fire exactly once, so a model that genuinely has nothing to call still
+    yields the turn instead of spinning.
+    """
+    ctx = _transcript_ctx()
+    seen: list = []
+
+    mock_llm = MagicMock()
+    mock_response = MagicMock()
+    mock_response.tool_calls = []
+    mock_response.content = "thinking out loud, calling nothing"
+
+    async def mock_ainvoke(*args, **kwargs):
+        seen.append(list(args[0]))
+        return mock_response
+
+    mock_llm.ainvoke = AsyncMock(side_effect=mock_ainvoke)
+    mock_llm.bind_tools.return_value = mock_llm
+
+    with patch("artemis.agents.operator.operator.get_llm", return_value=mock_llm):
+        node = OperatorNode(ctx, transcript_config=MemoryTranscriptConfig(enabled=True))
+        await node(_transcript_state())
+
+    assert len(seen) == 2, "expected exactly one retry after the nudge"
+    # The retry carries the model's own tool-less reply plus the nudge, so it
+    # can see what it did and what to do instead.
+    assert _NO_TOOL_CALL_NOTICE in str(seen[1][-1].content)
+    assert "thinking out loud" in str(seen[1][-2].content)

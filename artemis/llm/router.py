@@ -28,6 +28,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel, Field
 
 from artemis.config.settings import settings
+from artemis.llm.capabilities import capabilities_for
 from artemis.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -250,9 +251,11 @@ class ModelFactory:
                 or os.environ.get("GOOGLE_API_KEY")
                 or os.environ.get("GEMINI_API_KEY")
             )
-            thinking_level = endpoint.thinking_level
-            if endpoint.model_name and any(v in endpoint.model_name for v in ("2.5", "2.0", "1.5")):
-                thinking_level = None
+            # Gemini 3+ takes an explicit thinking level; older generations
+            # ignore or reject the parameter. That split lives in the
+            # capability table now, alongside every other per-model knob.
+            caps = capabilities_for(provider, endpoint.model_name)
+            thinking_level = endpoint.thinking_level if caps.supports_reasoning else None
 
             kwargs: dict[str, Any] = {
                 "model": endpoint.model_name,
@@ -305,17 +308,26 @@ class ModelFactory:
             base_url = endpoint.api_base or (
                 str(settings.OPENAI_BASE_URL) if settings.OPENAI_BASE_URL else None
             )
+            caps = capabilities_for(provider, endpoint.model_name)
             kwargs = {
                 "model": endpoint.model_name,
-                # Left unset unless configured: OpenAI's reasoning models reject
-                # `temperature` outright ("Unsupported parameter: 'temperature' is
-                # not supported with this model" on gpt-6-astra), and there is no
-                # value -- 0.0 included -- that they accept.
-                "temperature": endpoint.temperature,
+                # OpenAI's reasoning models reject `temperature` outright
+                # ("Unsupported parameter: 'temperature' is not supported with
+                # this model" on gpt-6-astra) and there is no value -- 0.0
+                # included -- that they accept, while gpt-4o and friends want
+                # the deterministic 0.0 ARTEMIS has always sent them.
+                "temperature": (
+                    _temperature_or(endpoint, 0.0) if caps.supports_temperature else None
+                ),
                 "max_tokens": endpoint.max_tokens,
                 "api_key": api_key,
                 "base_url": base_url,
                 "timeout": endpoint.timeout_seconds,
+                # One retry, not langchain's default of two. A reasoning call
+                # that outruns `timeout` is retried in full and silently, so the
+                # default turns one slow request into three and shows nothing in
+                # the log but a long gap.
+                "max_retries": 1,
                 # /v1/responses, not /v1/chat/completions. Reasoning models refuse
                 # function tools on the completions endpoint ("Function tools with
                 # reasoning_effort are not supported for gpt-6-astra in
@@ -329,6 +341,17 @@ class ModelFactory:
             }
             if endpoint.reasoning_effort:
                 kwargs["reasoning_effort"] = endpoint.reasoning_effort
+            if caps.carries_reasoning_inline:
+                # Replay the model's own reasoning back to it. Over /v1/responses
+                # langchain preserves reasoning items only while the server-side
+                # item ids in the message list stay resolvable, and ARTEMIS
+                # rewrites that list every turn (transcript ledger, screenshot
+                # scrubbing, capsule substitution). Asking for the encrypted
+                # content puts the reasoning inline in the AIMessage instead, so
+                # it survives the rewrite and the model stops re-deriving its
+                # chain of thought on every iteration of the Operator's loop.
+                kwargs["include"] = ["reasoning.encrypted_content"]
+                kwargs["output_version"] = "responses/v1"
             return ChatOpenAI(**{k: v for k, v in kwargs.items() if v is not None})
 
         elif provider == ModelProvider.ANTHROPIC:
@@ -343,14 +366,20 @@ class ModelFactory:
                 )
                 or os.environ.get("ANTHROPIC_API_KEY")
             )
+            caps = capabilities_for(provider, endpoint.model_name)
             kwargs = {
                 "model": endpoint.model_name,
-                # Left unset unless configured: `temperature` is deprecated on the
-                # newer Claude models and sending any value -- 0.0 included -- is a
-                # hard 400 ("`temperature` is deprecated for this model").
-                "temperature": endpoint.temperature,
+                # `temperature` is deprecated on the newer Claude models and
+                # sending any value -- 0.0 included -- is a hard 400
+                # ("`temperature` is deprecated for this model").
+                "temperature": (
+                    _temperature_or(endpoint, 0.0) if caps.supports_temperature else None
+                ),
                 "api_key": api_key,
                 "timeout": endpoint.timeout_seconds,
+                # See the OpenAI branch: one retry, so a slow call is not
+                # silently tripled.
+                "max_retries": 1,
             }
             budget = endpoint.thinking_budget
             if not budget and endpoint.reasoning_effort:
@@ -358,7 +387,13 @@ class ModelFactory:
                 budget = effort_map.get(endpoint.reasoning_effort.lower())
             if budget:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                kwargs["temperature"] = 1.0
+                # Extended thinking requires temperature 1.0 from the models that
+                # take the parameter at all -- but only from those. Forcing it on
+                # a model where temperature is deprecated trades one 400 for
+                # another, which is exactly what enabling thinking by default for
+                # Claude would otherwise have done.
+                if caps.supports_temperature:
+                    kwargs["temperature"] = 1.0
             return ChatAnthropic(**{k: v for k, v in kwargs.items() if v is not None})
 
         elif provider == ModelProvider.OPENROUTER:

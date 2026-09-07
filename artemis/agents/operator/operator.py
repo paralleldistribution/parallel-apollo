@@ -56,6 +56,35 @@ from artemis.utils.visualization import format_minimal_list_with_elements
 
 logger = get_logger(__name__)
 
+
+#: Sent when a turn comes back with no tool calls at all. Pro used to log
+#: "Encouraging action." and then encourage nothing -- it abandoned the turn,
+#: and the graph paid a full lap (execution_check -> convergence -> perception ->
+#: operator, re-capturing the screenshot and the UI tree) to ask the same
+#: question again. Flash has had this nudge all along; Gemini rarely needs it
+#: because its native path forces a tool call, which is why Pro never grew one.
+_NO_TOOL_CALL_NOTICE = (
+    "You ended your turn without calling any tool, so nothing was executed and"
+    " the screen has not changed. Call a Turn-Ending Action now. If you are not"
+    " ready to act, record what you have observed with a note tool instead."
+)
+
+
+def _endpoint_label(llm: Any) -> str:
+    """``provider:model`` for ``llm``, or a placeholder when it cannot say.
+
+    Used only to attribute slow calls in the log, so it must never be the
+    reason a turn fails -- a bare chat model (a fake, or a client built outside
+    the gateway) has no endpoint to report.
+    """
+    endpoint = getattr(llm, "endpoint", None)
+    provider = getattr(endpoint, "provider", None)
+    model = getattr(endpoint, "model_name", None)
+    if provider and model:
+        return f"{getattr(provider, 'value', provider)}:{model}"
+    return type(llm).__name__
+
+
 DEFERRING_TOOLS = {
     "ask_diagnoser",
     "video_analyzer",
@@ -442,6 +471,7 @@ class OperatorNode:
         native_thoughts = []
         tool_limit_exceeded = False
         plan_gate_bounced = False
+        no_tool_call_nudged = False
 
         for iteration in range(max_iterations):
             if iteration == max_iterations - 1:
@@ -460,7 +490,10 @@ class OperatorNode:
                 )
 
             bound_llm = base_llm.bind_tools(tools=traced_tools)
-            response = await invoke_llm_with_timeout_message(acomplete(bound_llm, current_messages))
+            response = await invoke_llm_with_timeout_message(
+                acomplete(bound_llm, current_messages),
+                label=f"operator {_endpoint_label(base_llm)}",
+            )
 
             if hasattr(response, "response_metadata") and response.response_metadata:
                 usage = (
@@ -522,8 +555,14 @@ class OperatorNode:
                     logger.error(f"Failed to parse function_call fallback: {e}")
 
             if not response.tool_calls:
+                if no_tool_call_nudged:
+                    logger.warning("LLM stopped without calling any tool again; yielding the turn.")
+                    break
+                no_tool_call_nudged = True
                 logger.warning("LLM stopped without calling any tool. Encouraging action.")
-                break
+                current_messages.append(response)
+                current_messages.append(SystemMessage(content=_NO_TOOL_CALL_NOTICE))
+                continue
 
             current_messages.append(response)
 

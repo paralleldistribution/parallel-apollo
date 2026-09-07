@@ -30,6 +30,7 @@ from artemis.config.constants import (
 )
 from artemis.config.paths import ROOT_DIR, get_config_path
 from artemis.config.settings import settings
+from artemis.llm.capabilities import capabilities_for, clamp_reasoning_effort
 from artemis.utils.file import load_jsonc
 from artemis.utils.logger import get_logger
 
@@ -77,7 +78,7 @@ class LLM(BaseModel):
     temperature: float | None = None
     thinking_budget: int | None = None
     thinking_level: Literal["minimal", "low", "medium", "high"] | None = None
-    reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
     include_thoughts: bool | None = None
     enable_grounding: bool | None = None
 
@@ -378,10 +379,6 @@ MODEL_OVERRIDE_AGENT_NODES = (
 #: slower keyframe-extraction engine the universal providers fall back to.
 MODEL_OVERRIDE_UTILS_NODES = ("outputter",)
 
-#: Providers that read ``thinking_level`` / ``include_thoughts``. Every other
-#: provider branch in artemis.llm.router reads ``reasoning_effort`` instead.
-_THINKING_LEVEL_PROVIDERS = ("google", "vertexai")
-
 #: Non-canonical spellings accepted for convenience, mirroring
 #: ``ModelProvider.from_string`` in artemis.llm.router.
 _PROVIDER_ALIASES = {
@@ -404,36 +401,50 @@ def normalize_provider(provider: str) -> str:
     return canonical
 
 
-def _node_override(provider: str, model: str) -> dict:
-    """Build the merge patch for one node, dropping knobs its provider cannot use.
+def _node_override(provider: str, model: str, node_cfg: Any = None) -> dict:
+    """Build the merge patch for one node, translating its reasoning budget.
 
     ``thinking_level`` and ``include_thoughts`` are read only by the Google and
     VertexAI branches of ``ModelFactory.create_model``, so they are cleared for
     every other provider to keep the config honest about what is in effect.
 
-    They are deliberately NOT translated into ``reasoning_effort``. That knob is
-    per-MODEL, not per-provider: OpenAI rejects it outright on a non-reasoning
-    model (``gpt-4o-mini`` answers every such call with
-    ``400 Unrecognized request argument supplied: reasoning_effort``), and on
-    Anthropic it turns into an extended-thinking budget that older models do not
-    accept. Since a caller asking for a model supplies only provider and model,
-    inferring a reasoning budget for it would break more models than it helps --
-    the requested model runs with its own provider defaults instead. A node that
-    genuinely needs one can still set ``reasoning_effort`` in artemis.jsonc; the
-    merge leaves that explicit choice alone.
+    What used to happen next was nothing: the node's configured intent
+    (``planner: high``, ``operator: medium``) was simply dropped, because
+    ``reasoning_effort`` is a per-MODEL knob and no per-provider rule could send
+    it safely -- ``gpt-4o-mini`` answers it with ``400 Unrecognized request
+    argument``, while ``gpt-6-astra`` needs it. The consequence was that every
+    non-Google run drove every node at the provider's own default effort,
+    including the Operator, which is the great majority of a run's calls and the
+    node that least wants a large thinking budget.
+
+    :func:`artemis.llm.capabilities.capabilities_for` now answers that question
+    per model, so the intent survives: an explicit ``reasoning_effort`` wins, a
+    configured ``thinking_level`` is translated when the model has an effort
+    scale, and the knob is cleared -- explicit value included -- when the model
+    has none. ``gpt-4o-mini`` still receives nothing.
     """
-    return {
-        "provider": provider,
-        "model": model,
-        # An explicitly requested model must never be silently swapped back to
-        # the config's Gemini fallback partway through a run.
-        "fallback": {"provider": provider, "model": model},
-        **(
-            {}
-            if provider in _THINKING_LEVEL_PROVIDERS
-            else {"thinking_level": None, "include_thoughts": None}
-        ),
+    caps = capabilities_for(provider, model)
+    # An explicitly requested model must never be silently swapped back to the
+    # config's Gemini fallback partway through a run.
+    target = {"provider": provider, "model": model}
+    if caps.is_gemini_family:
+        # Google and VertexAI read the budget natively as ``thinking_level``;
+        # leave their knobs, and their thought traces, exactly as configured.
+        return {**target, "fallback": target}
+
+    intent = getattr(node_cfg, "reasoning_effort", None) or getattr(
+        node_cfg, "thinking_level", None
+    )
+    reasoning = {
+        "thinking_level": None,
+        "include_thoughts": None,
+        "reasoning_effort": clamp_reasoning_effort(intent, caps),
     }
+    # The fallback is pinned to the same model, so it needs the same clamping.
+    # Patching only provider/model there would leave it merged onto the Gemini
+    # knobs it inherited, and a fallback carrying an effort its model rejects is
+    # a 400 on the one call path that exists to rescue a failing one.
+    return {**target, **reasoning, "fallback": {**target, **reasoning}}
 
 
 def apply_model_override(config: LLMConfig, provider: str | None, model: str | None) -> LLMConfig:
@@ -463,11 +474,15 @@ def apply_model_override(config: LLMConfig, provider: str | None, model: str | N
     canonical = normalize_provider(str(provider))
     model_name = str(model).strip()
 
+    # Each node's own patch: the per-node reasoning intent in `config` is what
+    # gets translated, so `planner: high` and `operator: low` stay distinct.
     overrides: dict[str, Any] = {
-        node: _node_override(canonical, model_name) for node in MODEL_OVERRIDE_AGENT_NODES
+        node: _node_override(canonical, model_name, getattr(config, node, None))
+        for node in MODEL_OVERRIDE_AGENT_NODES
     }
     overrides["utils"] = {
-        node: _node_override(canonical, model_name) for node in MODEL_OVERRIDE_UTILS_NODES
+        node: _node_override(canonical, model_name, getattr(config.utils, node, None))
+        for node in MODEL_OVERRIDE_UTILS_NODES
     }
     return deep_merge_llm_config(config, overrides)
 

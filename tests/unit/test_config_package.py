@@ -204,11 +204,13 @@ def test_apply_model_override_leaves_gemini_pinned_nodes_alone():
     assert overridden.planner_validation is None
 
 
-def test_apply_model_override_clears_gemini_only_knobs():
+def test_apply_model_override_translates_the_reasoning_budget():
     """thinking_level/include_thoughts are Gemini-only and are dropped elsewhere.
 
-    They are deliberately not translated into reasoning_effort: that knob is
-    per-model, and OpenAI rejects it outright on a non-reasoning model.
+    The budget they express is not dropped with them: it is translated into
+    whatever the requested model accepts, per model rather than per provider.
+    Before that translation existed, every non-Google run drove every node --
+    the Operator included -- at the provider's own default effort.
     """
     default = get_default_llm_config()
     assert default.planner.thinking_level == "high"
@@ -216,15 +218,48 @@ def test_apply_model_override_clears_gemini_only_knobs():
 
     claude = apply_model_override(default, "anthropic", "claude-opus-5")
     assert claude.planner.thinking_level is None
-    assert claude.planner.reasoning_effort is None
     assert claude.operator.include_thoughts is None
-    assert claude.operator.reasoning_effort is None
+    # The per-node intent survives, and the nodes stay distinct from each other.
+    assert claude.planner.reasoning_effort == "high"
+    assert claude.operator.reasoning_effort == "low"
+    assert claude.checker.reasoning_effort == "medium"
+
+    astra = apply_model_override(default, "openai", "gpt-6-astra")
+    assert astra.planner.reasoning_effort == "high"
+    assert astra.operator.reasoning_effort == "low"
 
     # Staying on Google keeps the native knobs untouched.
     gemini = apply_model_override(default, "gemini", "gemini-3.8-flash")
     assert gemini.planner.provider == "google"
     assert gemini.planner.thinking_level == "high"
     assert gemini.operator.include_thoughts is True
+
+
+def test_apply_model_override_sends_no_reasoning_knob_to_a_model_without_one():
+    """gpt-4o-mini answers reasoning_effort with a 400, so it must receive none.
+
+    This is the reason the translation is keyed on the model and not on the
+    provider, and the reason an explicitly configured effort is cleared rather
+    than forwarded.
+    """
+    default = deep_merge_llm_config(
+        get_default_llm_config(), {"planner": {"reasoning_effort": "high"}}
+    )
+    mini = apply_model_override(default, "openai", "gpt-4o-mini")
+    assert mini.planner.reasoning_effort is None
+    assert mini.operator.reasoning_effort is None
+    # The fallback is pinned to the same model, so it is clamped the same way.
+    assert mini.planner.fallback.reasoning_effort is None
+
+
+def test_apply_model_override_clamps_the_fallback_too():
+    """A fallback carrying an effort its model rejects would 400 on the one path
+    that exists to rescue a failing call."""
+    astra = apply_model_override(get_default_llm_config(), "openai", "gpt-6-astra")
+    assert astra.planner.fallback.model == "gpt-6-astra"
+    assert astra.planner.fallback.reasoning_effort == "high"
+    assert astra.planner.fallback.thinking_level is None
+    assert astra.operator.fallback.reasoning_effort == "low"
 
 
 def test_apply_model_override_rejects_bad_input():
@@ -968,3 +1003,66 @@ def test_provider_branches_apply_the_right_temperature_default():
     # Reasoning models refuse function tools on /v1/chat/completions, and every
     # ARTEMIS agent binds tools, so the OpenAI branch talks to /v1/responses.
     assert openai_client.use_responses_api is True
+
+    # A non-reasoning OpenAI model still gets the deterministic 0.0 it wants.
+    assert client_for("openai", "gpt-4o-mini").temperature == 0.0
+
+
+def test_openai_reasoning_client_replays_its_own_reasoning():
+    """Without this the model re-derives its chain of thought every turn.
+
+    Over /v1/responses langchain preserves reasoning items only while the
+    server-side item ids in the message list stay resolvable, and ARTEMIS
+    rewrites that list on every turn, so the reasoning has to travel inline.
+    """
+    from types import SimpleNamespace
+
+    from artemis.llm.router import ModelFactory
+    from artemis.services.llm import _resolve_endpoint
+
+    def client_for(provider: str, model: str, node: str = "planner"):
+        cfg = apply_model_override(get_default_llm_config(), provider, model)
+        endpoint = _resolve_endpoint(
+            SimpleNamespace(llm_config=cfg), node, is_utils=False, use_fallback=False
+        )
+        return ModelFactory.get_model(endpoint)
+
+    astra = client_for("openai", "gpt-6-astra")
+    assert astra.include == ["reasoning.encrypted_content"]
+    assert astra.output_version == "responses/v1"
+    # The per-node budget reaches the client, and the Operator is downshifted:
+    # it is the great majority of a run's calls and is a perception loop.
+    assert astra.reasoning_effort == "high"
+    assert client_for("openai", "gpt-6-astra", "operator").reasoning_effort == "low"
+
+    # A non-reasoning model emits no reasoning items, so it asks for none.
+    mini = client_for("openai", "gpt-4o-mini")
+    assert mini.include is None
+    assert mini.reasoning_effort is None
+
+    # One SDK retry, not langchain's default of two: ARTEMIS retries at a higher
+    # level with classification and telemetry, and a silent triple-length retry
+    # of a slow reasoning call shows up as nothing but a long gap in the log.
+    assert astra.max_retries == 1
+
+
+def test_anthropic_thinking_does_not_reintroduce_a_rejected_temperature():
+    """Extended thinking requires temperature 1.0 from the models that take the
+    parameter at all -- but only from those."""
+    from types import SimpleNamespace
+
+    from artemis.llm.router import ModelFactory
+    from artemis.services.llm import _resolve_endpoint
+
+    def client_for(provider: str, model: str):
+        cfg = apply_model_override(get_default_llm_config(), provider, model)
+        endpoint = _resolve_endpoint(
+            SimpleNamespace(llm_config=cfg), "planner", is_utils=False, use_fallback=False
+        )
+        return ModelFactory.get_model(endpoint)
+
+    opus = client_for("anthropic", "claude-opus-5")
+    assert opus.thinking == {"type": "enabled", "budget_tokens": 32768}
+    # `temperature` is deprecated on this model; forcing 1.0 for thinking would
+    # trade one 400 for another.
+    assert opus.temperature is None

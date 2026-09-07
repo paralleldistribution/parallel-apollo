@@ -37,7 +37,11 @@ from artemis.utils.plan_grammar import parse_plan, render_plan_grammar_spec
 logger = get_logger(__name__)
 
 
-from artemis.agents.prompt_assembly import render_tool_enum, resolve_available
+from artemis.agents.prompt_assembly import (
+    render_tool_enum,
+    resolve_available,
+    terse_memory_discipline,
+)
 from artemis.mcp.action_specs import OPERATOR_SHELL_ORDER
 
 
@@ -291,6 +295,7 @@ def render_transcript_static_system(
         verification_active=verification_active,
         checks_active=include_checks,
         transcript_history=True,
+        terse_memory_discipline=terse_memory_discipline(ctx),
         max_burst_actions=_max_burst_actions_for_prompt(),
         max_tool_calls=OPERATOR_MAX_TOOL_ITERATIONS,
     )
@@ -336,6 +341,7 @@ class TemplatePromptComponent(PromptComponent):
             verification_active=verification_active,
             checks_active=include_checks,
             transcript_history=False,
+            terse_memory_discipline=terse_memory_discipline(ctx),
             max_burst_actions=_max_burst_actions_for_prompt(),
             max_tool_calls=OPERATOR_MAX_TOOL_ITERATIONS,
         )

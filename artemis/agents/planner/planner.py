@@ -46,6 +46,7 @@ from artemis.tools.tool_wrapper import (
 from artemis.utils.decorators import wrap_with_callbacks
 from artemis.utils.logger import get_logger
 from artemis.utils.notes import get_note_file_path
+from artemis.agents.prompt_assembly import terse_memory_discipline
 from artemis.utils.plan_grammar import (
     CHECKBOX_LINE_RE,
     STATUS_CHARS,
@@ -236,7 +237,8 @@ class PlannerNode:
         system_content = "\n\n".join(prompts_data["blocks"][block] for block in system_blocks)
 
         system_message = Template(system_content).render(
-            plan_grammar=render_plan_grammar_spec(include_checks)
+            plan_grammar=render_plan_grammar_spec(include_checks),
+            terse_memory_discipline=terse_memory_discipline(self.ctx, "planner"),
         )
 
         # Get screenshot

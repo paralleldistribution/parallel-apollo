@@ -54,6 +54,7 @@ from artemis.llm.reliability import (
     classify_failure,
     retry_policy_for,
 )
+from artemis.llm.capabilities import capabilities_for
 from artemis.llm.router import ModelEndpoint, ModelFactory, ModelProvider
 from artemis.services.token_meter import record_llm_usage
 from artemis.llm.structured import (
@@ -871,12 +872,26 @@ async def acomplete_structured(
     return parsed
 
 
+def _log_slow_call_returned(start_time: float, waited_before: float, suffix: str) -> None:
+    """Close out a slow-call notice with how long the call actually took."""
+    elapsed = asyncio.get_event_loop().time() - start_time + waited_before
+    user_messages_logger.info(f"LLM call returned after {elapsed:.1f}s{suffix}")
+
+
 async def invoke_llm_with_timeout_message[T](
     llm_call: Coroutine[Any, Any, T],
     timeout_seconds: int = 10,
     hard_timeout: int = 180,
+    label: str | None = None,
 ) -> T:
-    """Send an LLM call and display a countdown / timeout message if delayed."""
+    """Send an LLM call and display a countdown / timeout message if delayed.
+
+    ``label`` names the caller ("operator openai:gpt-6-astra") in the slow-call
+    messages. Without it a slow run reads as an unattributed gap in the log --
+    the reader can see that something took two minutes but not which node, model
+    or provider it was, which is precisely the question a benchmark asks.
+    """
+    suffix = f" ({label})" if label else ""
     llm_task = asyncio.create_task(llm_call)
     waiter_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
     try:
@@ -885,14 +900,17 @@ async def invoke_llm_with_timeout_message[T](
         if llm_task in done:
             return llm_task.result()
 
-        user_messages_logger.info("Waiting for LLM call response...")
+        user_messages_logger.info(f"Waiting for LLM call response...{suffix}")
         start_time = asyncio.get_event_loop().time()
 
         while True:
             try:
-                return await asyncio.wait_for(asyncio.shield(llm_task), timeout=1.0)
+                result = await asyncio.wait_for(asyncio.shield(llm_task), timeout=1.0)
+                _log_slow_call_returned(start_time, timeout_seconds, suffix)
+                return result
             except TimeoutError:
                 if llm_task.done():
+                    _log_slow_call_returned(start_time, timeout_seconds, suffix)
                     return llm_task.result()
 
                 pause_file = PAUSE_FILE
@@ -1040,6 +1058,43 @@ def get_cached_raw_model(
     return ModelFactory.get_model(ep)
 
 
+#: Request timeout, in seconds, for a node driven by a model whose calls can
+#: legitimately run for minutes (``slow_first_token``). Everything else keeps
+#: the historical flat 60s.
+#:
+#: The flat 60s was tuned on Gemini, whose calls return in seconds. A reasoning
+#: model auditing a 60-step history routinely outruns it, and the request is
+#: then killed and retried with nothing in the log but a gap -- which is what a
+#: 143s stall in a 10.8-minute run turned out to be.
+#:
+#: Capped below ``invoke_llm_with_timeout_message``'s 180s hard timeout: a
+#: client timeout above it only guarantees the call is killed from the other
+#: side, so the extra headroom would buy nothing.
+_SLOW_MODEL_TIMEOUTS: dict[str, float] = {
+    # A reactive perception turn; if it is taking this long something is wrong.
+    "operator": 90.0,
+    # One-shot deliberations over the whole run: goal decomposition, the exit
+    # audit, the final synthesis, and failure diagnosis.
+    "planner": 170.0,
+    "checker": 170.0,
+    "outputter": 170.0,
+    "diagnoser": 170.0,
+}
+
+#: Fallback for a slow model on a node not named above.
+_SLOW_MODEL_DEFAULT_TIMEOUT = 120.0
+
+#: The pre-existing default, kept for every model that returns promptly.
+_DEFAULT_TIMEOUT = 60.0
+
+
+def _default_timeout_for(name: str, provider: Any, model: str) -> float:
+    """The request timeout for one node, given the model actually behind it."""
+    if not capabilities_for(provider, model).slow_first_token:
+        return _DEFAULT_TIMEOUT
+    return _SLOW_MODEL_TIMEOUTS.get(name, _SLOW_MODEL_DEFAULT_TIMEOUT)
+
+
 def _resolve_endpoint(
     ctx: ArtemisContext,
     name: str,
@@ -1081,7 +1136,12 @@ def _resolve_endpoint(
         # newer Anthropic and OpenAI models reject outright. Each provider branch in
         # artemis.llm.router now supplies its own default for None.
         temperature=_get_val(cfg, "temperature", (int, float)),
-        timeout_seconds=_get_val(cfg, "timeout", (int, float)) or 60.0,
+        # An explicit `timeout` in artemis.jsonc still wins; the default now
+        # depends on whether the node's model is one that thinks for minutes.
+        timeout_seconds=(
+            _get_val(cfg, "timeout", (int, float))
+            or _default_timeout_for(name, provider_val, str(model_val))
+        ),
         thinking_budget=_get_val(cfg, "thinking_budget", int),
         thinking_level=_get_val(cfg, "thinking_level", str),
         reasoning_effort=_get_val(cfg, "reasoning_effort", str),

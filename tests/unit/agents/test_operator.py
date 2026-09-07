@@ -406,12 +406,19 @@ async def test_operator_dynamic_prompt():
     mock_response = MagicMock()
     mock_response.tool_calls = []
 
+    calls: list[list] = []
+
     async def mock_ainvoke(*args, **kwargs):
         messages = args[0]
-        assert len(messages) == 2
-        assert messages[0].content == "System part."
-        assert messages[1].content[0]["text"] == "Human part."
-        assert messages[1].content[-1]["text"] == "Footer part."
+        calls.append(messages)
+        # Only the first invocation carries the freshly built prompt. A response
+        # with no tool calls is nudged and retried once, and that second
+        # invocation legitimately carries the nudge as well.
+        if len(calls) == 1:
+            assert len(messages) == 2
+            assert messages[0].content == "System part."
+            assert messages[1].content[0]["text"] == "Human part."
+            assert messages[1].content[-1]["text"] == "Footer part."
         return mock_response
 
     mock_llm.ainvoke.side_effect = mock_ainvoke

@@ -26,11 +26,47 @@ Prompts stay hand-written text; only the spots that mention tools are assembled:
 
 An unavailable tool therefore leaves no trace in the prompt at all -- the executable
 definition of "an unimplemented tool must cost the model nothing".
+
+One assembly point is keyed on the model rather than the tool set: see
+:func:`terse_memory_discipline`.
 """
 
 from collections.abc import Iterable, Sequence, Set
+from typing import Any
 
-__all__ = ["gate_segment", "render_tool_enum", "resolve_available"]
+__all__ = [
+    "gate_segment",
+    "render_tool_enum",
+    "resolve_available",
+    "terse_memory_discipline",
+]
+
+#: Providers whose models are given the bounded note/plan wording.
+#:
+#: ARTEMIS's prompts tell the agent that notes are free and that it should
+#: pre-build structured scratchpads. That is a nudge written against Gemini,
+#: which under-writes them; a model that follows it literally produces the
+#: opposite failure. On the benchmark task gpt-6-astra wrote 27 notes to
+#: gemini-3.8-flash's 8, including a 1.5 KB markdown ledger table and a 2.5 KB
+#: plan -- and because note arguments and the recited plan are re-sent on every
+#: turn until they are frozen, that verbosity crossed the segment-compression
+#: threshold three times, each crossing costing another model call.
+#:
+#: Gemini keeps the original wording byte for byte: it is tuned there, and this
+#: is a correction for the models that need the opposite push.
+_TERSE_MEMORY_PROVIDERS = frozenset({"openai", "anthropic"})
+
+
+def terse_memory_discipline(ctx: Any, node: str = "operator") -> bool:
+    """Whether ``node``'s model this run needs bounded note/plan wording.
+
+    Resolved per node rather than per run, so a mixed configuration gates each
+    prompt on the model that will actually read it. An unknown or unset model
+    keeps the original wording.
+    """
+    cfg = getattr(getattr(ctx, "llm_config", None), node, None)
+    provider = getattr(cfg, "provider", "")
+    return str(getattr(provider, "value", provider)).lower() in _TERSE_MEMORY_PROVIDERS
 
 
 def render_tool_enum(

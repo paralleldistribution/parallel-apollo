@@ -29,13 +29,12 @@ from shutil import which
 import sys
 import threading
 from types import NoneType
-from typing import TypeVar, overload
+from typing import Any, TypeVar, overload
 import uuid
 
 from adbutils import AdbClient
 from dotenv import load_dotenv
 from google import genai
-from langchain_google_genai import ChatGoogleGenerativeAI
 from PIL import Image
 from pydantic import BaseModel
 
@@ -93,6 +92,11 @@ from artemis.utils.media import (
 from artemis.utils.startup_progress import publish_startup_progress
 
 logger = get_logger(__name__)
+
+#: The Gemini model used for the pre-warm handshake. Some node is always Gemini
+#: -- the memory chunker and the perception utils are pinned there on purpose --
+#: so this pool is worth opening even on an OpenAI or Anthropic run.
+_PREWARM_GEMINI_MODEL = "gemini-3.8-flash"
 
 TOutput = TypeVar("TOutput", bound=BaseModel | None)
 
@@ -261,8 +265,39 @@ class Agent:
 
         return True
 
+    def _prewarm_targets(self) -> list[tuple[str, str]]:
+        """The distinct ``(provider, model)`` pairs this run will actually call.
+
+        The reasoning nodes follow ``--provider/--model``; the perception and
+        utility nodes stay pinned to Gemini by design (see
+        ``artemis.config.llm.MODEL_OVERRIDE_UTILS_NODES``), so a non-Google run
+        talks to two hosts and both are worth a handshake.
+        """
+        targets: list[tuple[str, str]] = []
+
+        def add(provider: Any, model: Any) -> None:
+            pair = (str(getattr(provider, "value", provider) or ""), str(model or ""))
+            if all(pair) and pair not in targets:
+                targets.append(pair)
+
+        llm_config = getattr(getattr(self._config, "default_profile", None), "llm_config", None)
+        for node in ("operator", "planner"):
+            cfg = getattr(llm_config, node, None)
+            if cfg is not None:
+                add(cfg.provider, cfg.model)
+        # The Gemini-pinned side: the memory chunker and the perception utils.
+        add("google", _PREWARM_GEMINI_MODEL)
+        return targets
+
     async def _prewarm_llm_connections(self, api_key: str | None = None):
-        """Pre-warms the HTTP2/gRPC connection pools for both Native GenAI and LangChain clients in the background."""
+        """Open the HTTP connection pools this run will use, in the background.
+
+        This used to ping ``gemini-3.8-flash`` unconditionally -- including on an
+        OpenAI or Anthropic run, where it warmed a pool the reasoning nodes never
+        touch and left their first real call to pay the full TCP and TLS
+        handshake. It also spent a billed generation to do it. Each target now
+        gets a cheap metadata request against the host it will actually use.
+        """
         if os.environ.get("ARTEMIS_FAKE_LLM") == "1":
             logger.info("ARTEMIS_FAKE_LLM=1 — skipping real LLM connection pre-warming.")
             publish_startup_progress(
@@ -272,34 +307,28 @@ class Agent:
         publish_startup_progress(
             "model_warmup", "Warming the model connection", session_id=self._session_id
         )
-        logger.info("Starting background pre-warming of Gemini API connection pools...")
         try:
-            key = api_key
-            if not key and settings.GOOGLE_API_KEY:
-                key = settings.GOOGLE_API_KEY.get_secret_value()
-
-            if not key:
-                logger.warning("Skipping LLM pre-warming: No API key available.")
-                publish_startup_progress(
-                    "model_ready",
-                    "Model connection will initialize on first use",
-                    session_id=self._session_id,
-                )
-                return
-
-            # 1. Pre-warm Native SDK client
-            client = genai.Client(api_key=key)
-
-            # 2. Pre-warm LangChain client
-            chat = ChatGoogleGenerativeAI(model="gemini-3.8-flash", google_api_key=key)
-
-            # Fire both calls concurrently in the background
-            await asyncio.gather(
-                client.aio.models.count_tokens(model="gemini-3.8-flash", contents="ping"),
-                chat.ainvoke("ping"),
+            targets = self._prewarm_targets()
+            logger.info(
+                "Starting background pre-warming of API connection pools: "
+                + ", ".join(f"{p}/{m}" for p, m in targets)
+            )
+            results = await asyncio.gather(
+                *(self._prewarm_one(p, m, api_key) for p, m in targets),
                 return_exceptions=True,
             )
-            logger.success("Gemini API connection pools successfully pre-warmed.")
+            warmed = []
+            for (target_provider, target_model), outcome in zip(targets, results):
+                if outcome is True:
+                    warmed.append(f"{target_provider}/{target_model}")
+                elif isinstance(outcome, BaseException):
+                    logger.debug(
+                        f"Pre-warm handshake for {target_provider}/{target_model} failed: {outcome}"
+                    )
+            if warmed:
+                logger.success(f"API connection pools successfully pre-warmed: {', '.join(warmed)}")
+            else:
+                logger.warning("No LLM connection pool could be pre-warmed.")
             publish_startup_progress(
                 "model_ready", "Model connection is ready", session_id=self._session_id
             )
@@ -310,6 +339,58 @@ class Agent:
                 "Model connection will initialize on first use",
                 session_id=self._session_id,
             )
+
+    async def _prewarm_one(self, provider: str, model: str, api_key: str | None = None) -> bool:
+        """Handshake with one provider. Never raises, never generates a token.
+
+        A generation would cost money and latency on every single run just to
+        open a socket, so each branch uses the cheapest authenticated request
+        that reaches the same host. A provider with no such request is skipped
+        rather than billed.
+
+        Failures are reported, not raised: the caller gathers these with
+        ``return_exceptions=True``, so a provider being unreachable degrades to
+        "not warmed" rather than breaking startup.
+        """
+        if provider in ("google", "vertexai"):
+            key = (
+                api_key
+                or (settings.GOOGLE_API_KEY.get_secret_value() if settings.GOOGLE_API_KEY else None)
+                or os.environ.get("GOOGLE_API_KEY")
+                or os.environ.get("GEMINI_API_KEY")
+            )
+            if not key:
+                return False
+            await genai.Client(api_key=key).aio.models.count_tokens(model=model, contents="ping")
+            return True
+
+        if provider == "openai":
+            from openai import AsyncOpenAI
+
+            key = (
+                settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else None
+            ) or os.environ.get("OPENAI_API_KEY")
+            if not key:
+                return False
+            base_url = str(settings.OPENAI_BASE_URL) if settings.OPENAI_BASE_URL else None
+            await AsyncOpenAI(api_key=key, base_url=base_url).models.retrieve(model)
+            return True
+
+        if provider == "anthropic":
+            from anthropic import AsyncAnthropic
+
+            key = (
+                settings.ANTHROPIC_API_KEY.get_secret_value()
+                if settings.ANTHROPIC_API_KEY
+                else None
+            ) or os.environ.get("ANTHROPIC_API_KEY")
+            if not key:
+                return False
+            await AsyncAnthropic(api_key=key).models.retrieve(model)
+            return True
+
+        logger.debug(f"No pre-warm handshake defined for provider {provider!r}; skipping.")
+        return False
 
     async def install_apk(self, apk_path: str | Path) -> None:
         """Install an APK on the connected device.

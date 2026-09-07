@@ -10,6 +10,13 @@
     "provider": "google",
     "model": "gemini-3.8-flash",
     "thinking_level": "medium",
+    // Non-Google models have no `thinking_level`; their branch in
+    // artemis.llm.router reads `reasoning_effort`, and apply_model_override
+    // translates whichever one a node declares into what its model accepts
+    // (and sends neither to a model that supports neither, e.g. gpt-4o-mini).
+    // Low by default: most nodes are reactive, and the ones that think for a
+    // living raise it below.
+    "reasoning_effort": "low",
     "fallback": {
       "provider": "google",
       "model": "gemini-3.7-flash",
@@ -54,12 +61,14 @@
   "nodes": {
     // 🧠 Planner: High-level goal decomposition and strategic step planning
     "planner": {
-      "thinking_level": "high"
+      "thinking_level": "high",
+      "reasoning_effort": "high"
     },
 
     // 🎯 Operator: Screen perception, element interaction, and direct execution
     "operator": {
       "thinking_level": "medium",
+      "reasoning_effort": "low",
       "include_thoughts": true
     },
 
@@ -86,7 +95,8 @@
     //  - "flash" version delegates directly to object_detector (requires Gemini ER model above).
     //  - "pro" / "ultra" versions run multi-turn ReAct loops (supports both Native Gemini and Universal Multi-Model LangChain engines).
     "explorer": {
-      "thinking_level": "medium"
+      "thinking_level": "medium",
+      "reasoning_effort": "low"
     },
 
     // 📋 Summarizer: Aggregates step history and generates structured outcome
@@ -120,6 +130,7 @@
     // Thoughts are streamed so the verifier's reasoning shows live in the timeline.
     "checker": {
       "thinking_level": "medium",
+      "reasoning_effort": "medium",
       "include_thoughts": true
     }
     // 🎯 Planner Validation: Advisory review of milestone changes.
