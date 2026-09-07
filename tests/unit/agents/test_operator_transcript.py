@@ -30,7 +30,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from artemis.agents.operator.operator import _NO_TOOL_CALL_NOTICE, OperatorNode
 from artemis.agents.operator.prompts import load_operator_prompts
@@ -342,3 +342,49 @@ async def test_tool_less_turn_is_nudged_once_before_yielding():
     # can see what it did and what to do instead.
     assert _NO_TOOL_CALL_NOTICE in str(seen[1][-1].content)
     assert "thinking out loud" in str(seen[1][-2].content)
+
+    # The nudge must be a human turn. Gemini rejects a request whose contents
+    # end on a model turn, and langchain hoists every SystemMessage out of the
+    # contents into `system_instruction` wherever it appears -- so a
+    # SystemMessage nudge appended after the model's own reply leaves the reply
+    # last and 400s the run. See the Gemini-shape test below.
+    assert isinstance(seen[1][-1], HumanMessage)
+
+
+@pytest.mark.asyncio
+async def test_nudged_request_is_a_shape_gemini_accepts():
+    """The retry must not reach Gemini ending on a model turn.
+
+    Asserted against the real converter rather than by inspecting our own list:
+    the failure mode is entirely in the translation, where SystemMessages are
+    lifted into `system_instruction` and stop terminating the contents.
+    """
+    from langchain_google_genai.chat_models import _parse_chat_history
+
+    ctx = _transcript_ctx()
+    seen: list = []
+
+    mock_llm = MagicMock()
+    # A real AIMessage, not a mock: this message is appended to the request and
+    # then translated, so the translation has to be exercised for real.
+    mock_response = AIMessage(content="reasoning, but calling nothing")
+
+    async def mock_ainvoke(*args, **kwargs):
+        seen.append(list(args[0]))
+        return mock_response
+
+    mock_llm.ainvoke = AsyncMock(side_effect=mock_ainvoke)
+    mock_llm.bind_tools.return_value = mock_llm
+
+    with patch("artemis.agents.operator.operator.get_llm", return_value=mock_llm):
+        node = OperatorNode(ctx, transcript_config=MemoryTranscriptConfig(enabled=True))
+        await node(_transcript_state())
+
+    assert len(seen) == 2
+    for attempt, messages in enumerate(seen):
+        _system_instruction, contents = _parse_chat_history(messages)
+        assert contents, f"attempt {attempt} sent no contents"
+        assert contents[-1].role != "model", (
+            f"attempt {attempt} ends on a model turn; Gemini answers that with"
+            " 400 'Requests ending with a model turn are not supported'"
+        )

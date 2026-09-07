@@ -16,7 +16,7 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
 from artemis.context import ArtemisContext
@@ -63,6 +63,12 @@ logger = get_logger(__name__)
 #: operator, re-capturing the screenshot and the UI tree) to ask the same
 #: question again. Flash has had this nudge all along; Gemini rarely needs it
 #: because its native path forces a tool call, which is why Pro never grew one.
+#:
+#: It is delivered as a HumanMessage, not a SystemMessage: langchain hoists every
+#: SystemMessage into Gemini's ``system_instruction`` no matter where it sits, so
+#: a system-message nudge appended after the model's own reply leaves the request
+#: ending on a model turn -- which Gemini rejects outright with
+#: ``400 Requests ending with a model turn are not supported``.
 _NO_TOOL_CALL_NOTICE = (
     "You ended your turn without calling any tool, so nothing was executed and"
     " the screen has not changed. Call a Turn-Ending Action now. If you are not"
@@ -560,8 +566,11 @@ class OperatorNode:
                     break
                 no_tool_call_nudged = True
                 logger.warning("LLM stopped without calling any tool. Encouraging action.")
-                current_messages.append(response)
-                current_messages.append(SystemMessage(content=_NO_TOOL_CALL_NOTICE))
+                if response.content:
+                    # Show the model what it just said -- but only if it said
+                    # something. An empty model turn is itself a bad request.
+                    current_messages.append(response)
+                current_messages.append(HumanMessage(content=_NO_TOOL_CALL_NOTICE))
                 continue
 
             current_messages.append(response)
