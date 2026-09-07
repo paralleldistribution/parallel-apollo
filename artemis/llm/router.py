@@ -90,7 +90,14 @@ class ModelEndpoint(BaseModel):
     model_name: str = Field(default="gemini-2.5-flash", description="Model name identifier")
     api_key: str | None = Field(default=None, description="API Key or secret")
     api_base: str | None = Field(default=None, description="Custom API endpoint base URL")
-    temperature: float = Field(default=0.0, description="Sampling temperature")
+    temperature: float | None = Field(
+        default=None,
+        description=(
+            "Sampling temperature. None means 'unset': each provider branch below"
+            " applies its own default, and the providers whose frontier models"
+            " reject the parameter outright omit it entirely."
+        ),
+    )
     max_tokens: int | None = Field(default=None, description="Maximum completion tokens")
     timeout_seconds: float = Field(default=60.0, description="Request timeout in seconds")
     is_multimodal: bool = Field(
@@ -130,6 +137,15 @@ class ModelEndpoint(BaseModel):
             self.api_base,
             api_key_digest,
         )
+
+
+def _temperature_or(endpoint: "ModelEndpoint", default: float) -> float:
+    """The endpoint's temperature, or a provider default when it is unset.
+
+    Used by the provider branches whose models all accept the parameter, so they
+    keep sending the deterministic default ARTEMIS has always used.
+    """
+    return default if endpoint.temperature is None else endpoint.temperature
 
 
 def _patch_langchain_google_genai():
@@ -240,7 +256,7 @@ class ModelFactory:
 
             kwargs: dict[str, Any] = {
                 "model": endpoint.model_name,
-                "temperature": endpoint.temperature,
+                "temperature": _temperature_or(endpoint, 0.0),
                 "max_output_tokens": endpoint.max_tokens,
                 "api_key": api_key,
                 "timeout": endpoint.timeout_seconds,
@@ -265,7 +281,7 @@ class ModelFactory:
 
             kwargs = {
                 "model_name": endpoint.model_name,
-                "temperature": endpoint.temperature,
+                "temperature": _temperature_or(endpoint, 0.0),
                 "max_output_tokens": endpoint.max_tokens,
                 "timeout": endpoint.timeout_seconds,
                 "thinking_budget": endpoint.thinking_budget,
@@ -291,11 +307,25 @@ class ModelFactory:
             )
             kwargs = {
                 "model": endpoint.model_name,
+                # Left unset unless configured: OpenAI's reasoning models reject
+                # `temperature` outright ("Unsupported parameter: 'temperature' is
+                # not supported with this model" on gpt-6-astra), and there is no
+                # value -- 0.0 included -- that they accept.
                 "temperature": endpoint.temperature,
                 "max_tokens": endpoint.max_tokens,
                 "api_key": api_key,
                 "base_url": base_url,
                 "timeout": endpoint.timeout_seconds,
+                # /v1/responses, not /v1/chat/completions. Reasoning models refuse
+                # function tools on the completions endpoint ("Function tools with
+                # reasoning_effort are not supported for gpt-6-astra in
+                # /v1/chat/completions. To use function tools, use /v1/responses"),
+                # and since every ARTEMIS agent binds tools that makes completions
+                # a dead end for them. reasoning_effort='none' is not an escape
+                # either -- these models reject that value too. Non-reasoning models
+                # (gpt-4o and friends) serve tools and structured output over
+                # /v1/responses just as well, so this is one path for all of them.
+                "use_responses_api": True,
             }
             if endpoint.reasoning_effort:
                 kwargs["reasoning_effort"] = endpoint.reasoning_effort
@@ -315,6 +345,9 @@ class ModelFactory:
             )
             kwargs = {
                 "model": endpoint.model_name,
+                # Left unset unless configured: `temperature` is deprecated on the
+                # newer Claude models and sending any value -- 0.0 included -- is a
+                # hard 400 ("`temperature` is deprecated for this model").
                 "temperature": endpoint.temperature,
                 "api_key": api_key,
                 "timeout": endpoint.timeout_seconds,
@@ -342,7 +375,7 @@ class ModelFactory:
             )
             return ChatOpenAI(
                 model=endpoint.model_name,
-                temperature=endpoint.temperature,
+                temperature=_temperature_or(endpoint, 0.0),
                 api_key=api_key,
                 base_url=endpoint.api_base or "https://openrouter.ai/api/v1",
                 timeout=endpoint.timeout_seconds,
@@ -358,7 +391,7 @@ class ModelFactory:
             )
             return ChatOpenAI(
                 model=endpoint.model_name,
-                temperature=endpoint.temperature,
+                temperature=_temperature_or(endpoint, 0.0),
                 api_key=api_key,
                 base_url=endpoint.api_base or "https://api.x.ai/v1",
                 timeout=endpoint.timeout_seconds,
@@ -373,7 +406,7 @@ class ModelFactory:
             )
             kwargs = {
                 "model": endpoint.model_name,
-                "temperature": endpoint.temperature,
+                "temperature": _temperature_or(endpoint, 0.0),
                 "max_tokens": endpoint.max_tokens,
                 "api_key": api_key,
                 "base_url": base_url,

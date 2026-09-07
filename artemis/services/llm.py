@@ -1076,7 +1076,11 @@ def _resolve_endpoint(
     return ModelEndpoint(
         provider=ModelProvider.from_string(provider_val),
         model_name=str(model_val),
-        temperature=_get_val(cfg, "temperature", (int, float)) or 0.0,
+        # No `or 0.0` here: that coercion made "unset" indistinguishable from an
+        # explicit 0.0, and there was then no way to NOT send the parameter -- which
+        # newer Anthropic and OpenAI models reject outright. Each provider branch in
+        # artemis.llm.router now supplies its own default for None.
+        temperature=_get_val(cfg, "temperature", (int, float)),
         timeout_seconds=_get_val(cfg, "timeout", (int, float)) or 60.0,
         thinking_budget=_get_val(cfg, "thinking_budget", int),
         thinking_level=_get_val(cfg, "thinking_level", str),

@@ -919,3 +919,52 @@ class TestRunTuningSummary:
         summary = run_tuning_for_profile("pro", checker=checker, explorer=explorer)
         assert summary["verification_level"] == verification_level_for_checker(checker)
         assert summary["explorer_mode"] == explorer.resolve(profile="pro")
+
+
+def test_endpoint_resolution_leaves_temperature_unset():
+    """An unconfigured temperature must stay None, not collapse to 0.0.
+
+    Newer Anthropic and OpenAI models reject `temperature` outright, so
+    "unset" has to survive resolution for the provider branches to omit it.
+    """
+    from types import SimpleNamespace
+
+    from artemis.services.llm import _resolve_endpoint
+
+    ctx = SimpleNamespace(llm_config=get_default_llm_config())
+    endpoint = _resolve_endpoint(ctx, "planner", is_utils=False, use_fallback=False)
+    assert endpoint.temperature is None
+
+    # An explicit 0.0 in the config still comes through as 0.0.
+    explicit = deep_merge_llm_config(get_default_llm_config(), {"planner": {"temperature": 0.0}})
+    endpoint = _resolve_endpoint(
+        SimpleNamespace(llm_config=explicit), "planner", is_utils=False, use_fallback=False
+    )
+    assert endpoint.temperature == 0.0
+
+
+def test_provider_branches_apply_the_right_temperature_default():
+    """Google keeps its deterministic 0.0; Anthropic and OpenAI omit the param."""
+    from types import SimpleNamespace
+
+    from artemis.llm.router import ModelFactory
+    from artemis.services.llm import _resolve_endpoint
+
+    def client_for(provider: str, model: str):
+        cfg = apply_model_override(get_default_llm_config(), provider, model)
+        endpoint = _resolve_endpoint(
+            SimpleNamespace(llm_config=cfg), "planner", is_utils=False, use_fallback=False
+        )
+        return ModelFactory.get_model(endpoint)
+
+    # Gemini has always been driven at temperature 0 and must stay that way.
+    assert client_for("google", "gemini-3.8-flash").temperature == 0.0
+
+    # `temperature` is deprecated on newer Claude models: any value is a 400.
+    assert client_for("anthropic", "claude-opus-5").temperature is None
+
+    openai_client = client_for("openai", "gpt-6-astra")
+    assert openai_client.temperature is None
+    # Reasoning models refuse function tools on /v1/chat/completions, and every
+    # ARTEMIS agent binds tools, so the OpenAI branch talks to /v1/responses.
+    assert openai_client.use_responses_api is True
