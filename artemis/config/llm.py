@@ -16,7 +16,7 @@
 
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import google.auth
 from google.auth.exceptions import DefaultCredentialsError
@@ -318,9 +318,17 @@ def parse_llm_config() -> LLMConfig:
         raise
 
 
-def initialize_llm_config() -> LLMConfig:
-    """Parse and validate credentials for LLMConfig."""
+def initialize_llm_config(provider: str | None = None, model: str | None = None) -> LLMConfig:
+    """Parse and validate credentials for LLMConfig.
+
+    ``provider`` / ``model`` apply a per-run override to the main reasoning nodes
+    (see :func:`apply_model_override`) before credentials are checked, so a run
+    asking for a provider whose key is missing fails here rather than deep inside
+    the graph.
+    """
     llm_config = parse_llm_config()
+    if provider or model:
+        llm_config = apply_model_override(llm_config, provider, model)
     llm_config.validate_providers()
     logger.success("LLM config initialized")
     return llm_config
@@ -344,6 +352,124 @@ def deep_merge_llm_config(base: LLMConfig, overrides: dict) -> LLMConfig:
 
     merge(base_dict, overrides)
     return LLMConfig.model_validate(base_dict)
+
+
+#: Agent nodes whose provider/model follow an explicit per-run override.
+MODEL_OVERRIDE_AGENT_NODES = (
+    "planner",
+    "summarizer",
+    "operator",
+    "operator_summarizer",
+    "log_reader_sub_agent",
+    "log_analyzer",
+    "diagnoser",
+    "checker",
+    "planner_avatar",
+    "history_analyzer_expert",
+    "diagnoser_expert",
+    "explorer",
+)
+
+#: Utils nodes that follow the override. The rest stay on whatever artemis.jsonc
+#: pins them to, and every one of them is pinned to Gemini on purpose:
+#: ``object_detector`` needs a Gemini ER model for spatial coordinate grounding,
+#: ``hopper`` is a deliberately cheap flash-lite package locator, and
+#: ``video_analyzer`` keeps the native Gemini Files API path instead of the
+#: slower keyframe-extraction engine the universal providers fall back to.
+MODEL_OVERRIDE_UTILS_NODES = ("outputter",)
+
+#: Providers that read ``thinking_level`` / ``include_thoughts``. Every other
+#: provider branch in artemis.llm.router reads ``reasoning_effort`` instead.
+_THINKING_LEVEL_PROVIDERS = ("google", "vertexai")
+
+#: Non-canonical spellings accepted for convenience, mirroring
+#: ``ModelProvider.from_string`` in artemis.llm.router.
+_PROVIDER_ALIASES = {
+    "gemini": "google",
+    "claude": "anthropic",
+    "grok": "xai",
+    "vertex": "vertexai",
+}
+
+
+def normalize_provider(provider: str) -> str:
+    """Canonicalize a provider name, raising ValueError on an unknown one."""
+    raw = str(provider or "").strip().lower()
+    canonical = _PROVIDER_ALIASES.get(raw, raw)
+    allowed = get_args(LLMProvider)
+    if canonical not in allowed:
+        raise ValueError(
+            f"Unknown LLM provider {provider!r}. Must be one of: " + ", ".join(allowed)
+        )
+    return canonical
+
+
+def _node_override(provider: str, model: str) -> dict:
+    """Build the merge patch for one node, dropping knobs its provider cannot use.
+
+    ``thinking_level`` and ``include_thoughts`` are read only by the Google and
+    VertexAI branches of ``ModelFactory.create_model``, so they are cleared for
+    every other provider to keep the config honest about what is in effect.
+
+    They are deliberately NOT translated into ``reasoning_effort``. That knob is
+    per-MODEL, not per-provider: OpenAI rejects it outright on a non-reasoning
+    model (``gpt-4o-mini`` answers every such call with
+    ``400 Unrecognized request argument supplied: reasoning_effort``), and on
+    Anthropic it turns into an extended-thinking budget that older models do not
+    accept. Since a caller asking for a model supplies only provider and model,
+    inferring a reasoning budget for it would break more models than it helps --
+    the requested model runs with its own provider defaults instead. A node that
+    genuinely needs one can still set ``reasoning_effort`` in artemis.jsonc; the
+    merge leaves that explicit choice alone.
+    """
+    return {
+        "provider": provider,
+        "model": model,
+        # An explicitly requested model must never be silently swapped back to
+        # the config's Gemini fallback partway through a run.
+        "fallback": {"provider": provider, "model": model},
+        **(
+            {}
+            if provider in _THINKING_LEVEL_PROVIDERS
+            else {"thinking_level": None, "include_thoughts": None}
+        ),
+    }
+
+
+def apply_model_override(config: LLMConfig, provider: str | None, model: str | None) -> LLMConfig:
+    """Point the main reasoning nodes at one provider/model.
+
+    The Gemini-pinned perception and utility nodes (see
+    ``MODEL_OVERRIDE_UTILS_NODES``) and the lightweight judges are left exactly
+    as configured, so a Google API key stays required even for an OpenAI or
+    Anthropic run.
+
+    Args:
+        config: The parsed configuration to override.
+        provider: Target provider; any name accepted by :func:`normalize_provider`.
+        model: Target model id for that provider.
+
+    Returns:
+        A new LLMConfig with the reasoning nodes repointed.
+
+    Raises:
+        ValueError: if either argument is missing or the provider is unknown.
+    """
+    if not str(provider or "").strip() or not str(model or "").strip():
+        raise ValueError(
+            "Both provider and model are required to override the LLM "
+            f"(got provider={provider!r}, model={model!r})."
+        )
+    canonical = normalize_provider(str(provider))
+    model_name = str(model).strip()
+
+    overrides: dict[str, Any] = {
+        node: _node_override(canonical, model_name) for node in MODEL_OVERRIDE_AGENT_NODES
+    }
+    overrides["utils"] = {
+        node: _node_override(canonical, model_name) for node in MODEL_OVERRIDE_UTILS_NODES
+    }
+    return deep_merge_llm_config(config, overrides)
 
 
 def load_llm_config_override(path: Path | str) -> LLMConfig:

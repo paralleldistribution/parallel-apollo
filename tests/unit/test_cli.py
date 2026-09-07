@@ -48,6 +48,50 @@ def test_cli_run_help():
     assert "--traces-path" in result.output
     assert "--verification-level" in result.output
     assert "--explorer-pro-mode" in result.output
+    assert "--provider" in result.output
+    assert "--model" in result.output
+
+
+def test_cli_run_requires_provider_and_model_together():
+    """Half a model override is rejected before anything starts."""
+    for args in (
+        ["run", "--standalone", "--provider", "anthropic", "Open Settings"],
+        ["run", "--standalone", "--model", "claude-opus-5", "Open Settings"],
+    ):
+        result = runner.invoke(app, args)
+        assert result.exit_code != 0, result.output
+        assert "--provider and --model must be given together" in result.output
+
+
+def test_cli_run_forwards_the_model_override(monkeypatch):
+    """`artemis run --provider/--model` reaches initialize_llm_config."""
+    import artemis.interfaces.cli.commands.run as run_module
+
+    captured: dict = {}
+
+    async def fake_execute_task(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(run_module, "execute_task", fake_execute_task)
+    # The cosmetic device banner needs a live adb server; skip it so the test
+    # exercises argument forwarding only.
+    monkeypatch.setattr(run_module, "which", lambda _: None)
+    monkeypatch.setattr(run_module, "display_device_status", lambda *_, **__: None)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--standalone",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-opus-5",
+            "Open Settings",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["provider"] == "anthropic"
+    assert captured["model"] == "claude-opus-5"
 
 
 def test_cli_batch_help():

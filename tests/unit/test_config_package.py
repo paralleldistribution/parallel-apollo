@@ -30,6 +30,9 @@ from artemis.config import (
     cleanup_temp_dir,
     clear_ipc_port,
     clear_ls_address,
+    MODEL_OVERRIDE_AGENT_NODES,
+    MODEL_OVERRIDE_UTILS_NODES,
+    apply_model_override,
     deep_merge_llm_config,
     get_app_dir,
     get_config_path,
@@ -166,6 +169,75 @@ def test_llm_config_parsing_and_merging():
     merged = deep_merge_llm_config(llm_cfg, overrides)
     assert merged.planner.model == "custom-model-v1"
     assert merged.planner.temperature == 0.7
+
+
+def test_apply_model_override_repoints_reasoning_nodes():
+    """A per-run override moves the reasoning nodes and their fallbacks together."""
+    overridden = apply_model_override(get_default_llm_config(), "anthropic", "claude-opus-5")
+
+    for node in MODEL_OVERRIDE_AGENT_NODES:
+        cfg = getattr(overridden, node)
+        assert (cfg.provider, cfg.model) == ("anthropic", "claude-opus-5"), node
+        # An explicit choice must not be swapped back to the configured Gemini
+        # fallback partway through a run.
+        assert (cfg.fallback.provider, cfg.fallback.model) == ("anthropic", "claude-opus-5"), node
+
+    for node in MODEL_OVERRIDE_UTILS_NODES:
+        cfg = getattr(overridden.utils, node)
+        assert (cfg.provider, cfg.model) == ("anthropic", "claude-opus-5"), node
+
+
+def test_apply_model_override_leaves_gemini_pinned_nodes_alone():
+    """Perception and cheap-utility nodes keep their configured Gemini models."""
+    default = get_default_llm_config()
+    overridden = apply_model_override(default, "openai", "gpt-5")
+
+    assert overridden.utils.object_detector.provider == "google"
+    assert overridden.utils.object_detector.model == default.utils.object_detector.model
+    assert overridden.utils.hopper.provider == "google"
+    assert overridden.utils.hopper.model == default.utils.hopper.model
+    assert overridden.utils.video_analyzer.provider == "google"
+    assert overridden.utils.video_analyzer.model == default.utils.video_analyzer.model
+    # The lightweight judges are unset in the config and fall back to their own
+    # flash-lite factory default, so they are untouched too.
+    assert overridden.validator_pixel_safety_net is None
+    assert overridden.planner_validation is None
+
+
+def test_apply_model_override_clears_gemini_only_knobs():
+    """thinking_level/include_thoughts are Gemini-only and are dropped elsewhere.
+
+    They are deliberately not translated into reasoning_effort: that knob is
+    per-model, and OpenAI rejects it outright on a non-reasoning model.
+    """
+    default = get_default_llm_config()
+    assert default.planner.thinking_level == "high"
+    assert default.operator.include_thoughts is True
+
+    claude = apply_model_override(default, "anthropic", "claude-opus-5")
+    assert claude.planner.thinking_level is None
+    assert claude.planner.reasoning_effort is None
+    assert claude.operator.include_thoughts is None
+    assert claude.operator.reasoning_effort is None
+
+    # Staying on Google keeps the native knobs untouched.
+    gemini = apply_model_override(default, "gemini", "gemini-3.8-flash")
+    assert gemini.planner.provider == "google"
+    assert gemini.planner.thinking_level == "high"
+    assert gemini.operator.include_thoughts is True
+
+
+def test_apply_model_override_rejects_bad_input():
+    """An unknown provider or a half-specified override is a plain ValueError."""
+    llm_cfg = get_default_llm_config()
+
+    with pytest.raises(ValueError, match="Unknown LLM provider"):
+        apply_model_override(llm_cfg, "definitely-not-a-provider", "some-model")
+
+    with pytest.raises(ValueError, match="Both provider and model are required"):
+        apply_model_override(llm_cfg, "anthropic", "")
+    with pytest.raises(ValueError, match="Both provider and model are required"):
+        apply_model_override(llm_cfg, None, "claude-opus-5")
 
 
 def test_agent_config_loading():

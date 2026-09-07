@@ -5,6 +5,9 @@
 
   // ------------------------------------------------------------------------------
   // 1. Global Default Model (Applied to all sub-agents unless overridden below)
+  // `artemis run --provider <p> --model <m>` overrides this per run, but only for
+  // the main reasoning nodes; the Gemini-pinned perception/utility nodes below
+  // (object_detector, hopper, video_analyzer) keep whatever is configured here.
   // ------------------------------------------------------------------------------
   "default": {
     "provider": "google",

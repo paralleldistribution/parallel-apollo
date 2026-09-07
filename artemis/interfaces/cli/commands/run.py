@@ -59,6 +59,8 @@ async def execute_task(
     explorer_flash_mode: str | None = None,
     explorer_pro_mode: str | None = None,
     verification_level: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> None:
     """Executes a single mobile automation task end-to-end.
 
@@ -79,6 +81,10 @@ async def execute_task(
         explorer_pro_mode: Override the Explorer tier for the Pro execution profile.
         verification_level: Coarse Checker preset ('off', 'final', 'checkpoints',
             'strict'); applied before the explicit ``enable_checker`` switch.
+        provider: Optional LLM provider override for the main reasoning nodes.
+            Must be given together with ``model``.
+        model: Optional LLM model override for the main reasoning nodes. Must be
+            given together with ``provider``.
     """
     effective_sid = (
         session_id or os.getenv("ARTEMIS_SESSION_ID") or os.getenv("ARTEMIS_CLOUD_SESSION_ID")
@@ -93,7 +99,7 @@ async def execute_task(
         session_id=str(effective_sid) if effective_sid else None,
     )
 
-    llm_config = initialize_llm_config()
+    llm_config = initialize_llm_config(provider=provider, model=model)
     agent_profile = AgentProfile(name="default", llm_config=llm_config)
     config = Builders.AgentConfig.with_default_profile(profile=agent_profile)
 
@@ -344,10 +350,38 @@ def run_command(
             help="Run in standalone embedded mode without auto-spawning the Artemis Daemon.",
         ),
     ] = False,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help=(
+                "LLM provider for the main reasoning nodes, overriding artemis.jsonc"
+                " (e.g. 'google', 'openai', 'anthropic'). Requires --model. The"
+                " Gemini-pinned perception nodes (object detector, hopper, video"
+                " analyzer) are never overridden, so a Google key stays required."
+            ),
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="LLM model id for the main reasoning nodes. Requires --provider.",
+        ),
+    ] = None,
 ) -> None:
     """Run an autonomous UI automation task on the connected Android device."""
     if with_video_recording_tools:
         check_ffmpeg_available()
+
+    # Half an override is never what the caller meant: silently keeping the
+    # configured provider for a foreign model id (or vice versa) fails much later
+    # with an opaque provider error.
+    if bool(provider) != bool(model):
+        raise typer.BadParameter(
+            "--provider and --model must be given together"
+            f" (got provider={provider!r}, model={model!r})."
+        )
 
     console = Console()
 
@@ -356,6 +390,16 @@ def run_command(
         or os.environ.get("ARTEMIS_DEVICE_QUEUE_TICKET") is not None
     )
     is_standalone = standalone or os.environ.get("ARTEMIS_STANDALONE") == "1"
+
+    # The Daemon's /api/run carries no provider/model field, so routing an
+    # explicit override through it would silently drop it and run the configured
+    # Gemini default instead. Keep the caller's model and run locally.
+    if (provider or model) and not is_worker and not is_standalone:
+        console.print(
+            "[yellow]--provider/--model are not carried by the Artemis Daemon;"
+            " running locally instead.[/yellow]"
+        )
+        is_standalone = True
 
     # All platforms route through unified Artemis Daemon unless specifically configured as standalone
     if not is_worker and not is_standalone:
@@ -488,6 +532,8 @@ def run_command(
                 explorer_flash_mode=explorer_flash_mode,
                 explorer_pro_mode=explorer_pro_mode,
                 verification_level=verification_level,
+                provider=provider,
+                model=model,
             )
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
