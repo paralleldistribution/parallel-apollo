@@ -14,6 +14,8 @@
 
 """Unit tests for ARTEMIS Unified CLI application."""
 
+import os
+
 from typer.testing import CliRunner
 from artemis.interfaces.cli.main import app
 
@@ -724,3 +726,81 @@ def test_cli_server_lifecycle_aliases(monkeypatch):
     assert "restart" in help_result.output
     assert "stop" in help_result.output
     assert "status" in help_result.output
+
+
+def test_trace_purge_rejects_a_dir_outside_the_traces_tree(tmp_path):
+    """--trace-dir arrives from argv, so it must not delete arbitrary paths."""
+    import json as _json
+
+    victim = tmp_path / "not-traces"
+    victim.mkdir()
+    (victim / "precious.txt").write_text("keep me")
+
+    result = runner.invoke(
+        app,
+        [
+            "trace",
+            "purge",
+            "5d1f0e0e-0000-4000-8000-000000000000",
+            "--path",
+            str(tmp_path / "traces"),
+            "--trace-dir",
+            str(victim),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert _json.loads(result.output.strip().splitlines()[-1])["status"] == "rejected"
+    assert (victim / "precious.txt").is_file()
+
+
+def test_trace_purge_removes_the_run_and_reports_bytes(tmp_path, monkeypatch):
+    """The compiled trace dir, session dir and root leftovers all go."""
+    import json as _json
+
+    from artemis.config import settings as artemis_settings
+
+    traces = tmp_path / "traces"
+    session_id = "5d1f0e0e-0000-4000-8000-000000000000"
+    trace_dir = traces / "apollo-1-stamp_PASS_ts"
+    trace_dir.mkdir(parents=True)
+    (trace_dir / "recording.mp4").write_bytes(b"\x00" * 4096)
+    (traces / session_id / "notes").mkdir(parents=True)
+    (traces / session_id / "notes" / "output.md").write_text("# report\n")
+    (traces / f"{session_id}.result.json").write_text("{}")
+    # an image older than the cutoff, and one inside it that must survive
+    images = traces / "images"
+    images.mkdir()
+    stale, fresh = images / "stale.jpg", images / "fresh.jpg"
+    stale.write_bytes(b"\x00" * 512)
+    fresh.write_bytes(b"\x00" * 512)
+    os.utime(stale, (0, 0))
+
+    monkeypatch.setattr(artemis_settings, "DATA_ENGINE_DB_PATH", tmp_path / "de.db", raising=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "trace",
+            "purge",
+            session_id,
+            "--path",
+            str(traces),
+            "--trace-dir",
+            str(trace_dir),
+            "--prune-images-older-than",
+            "60",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    summary = _json.loads(result.output.strip().splitlines()[-1])
+    assert summary["status"] == "purged"
+    assert summary["bytes_reclaimed"] >= 4096
+
+    assert not trace_dir.exists()
+    assert not (traces / session_id).exists()
+    assert not (traces / f"{session_id}.result.json").exists()
+    # the shared image cache is pruned by age so a concurrent run keeps its own
+    assert not stale.exists()
+    assert fresh.is_file()
