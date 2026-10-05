@@ -11,6 +11,10 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import time
+
+
+READ_ONLY_LEASE_TIMEOUT_SECONDS = 30.0
 
 
 class ActiveSessionError(RuntimeError):
@@ -27,7 +31,6 @@ def image_lease(database: Path):
             yield
         return
     import msvcrt
-    import time
 
     with Path(str(database) + ".images.activity.lock").open("a+b") as stream:
         deadline = time.monotonic() + 30
@@ -54,20 +57,38 @@ def image_lease(database: Path):
 
 
 @contextmanager
-def _path_lease(path: Path, *, exclusive: bool, blocking: bool, create: bool = False):
+def _path_lease(
+    path: Path,
+    *,
+    exclusive: bool,
+    blocking: bool,
+    create: bool = False,
+    timeout_s: float | None = None,
+):
     import fcntl
 
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT if create else os.O_RDONLY, 0o666)
     try:
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        if not blocking:
+        deadline = time.monotonic() + timeout_s if blocking and timeout_s is not None else None
+        if not blocking or deadline is not None:
             flags |= fcntl.LOCK_NB
-        try:
-            fcntl.flock(descriptor, flags)
-        except BlockingIOError as exc:
-            raise RuntimeError(
-                "database is in use; maintenance requires idle Artemis sessions"
-            ) from exc
+        while True:
+            try:
+                fcntl.flock(descriptor, flags)
+                break
+            except BlockingIOError as exc:
+                if deadline is None:
+                    raise RuntimeError(
+                        "database is in use; maintenance requires idle Artemis sessions"
+                    ) from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out after {timeout_s:g}s waiting for storage maintenance in "
+                        f"{path}; retry trace inspection after maintenance finishes."
+                    ) from exc
+                time.sleep(min(0.05, remaining))
         try:
             yield
         finally:
@@ -92,6 +113,7 @@ def database_lease(
     either kind of operation from starting until maintenance has finished. The
     directory lock conservatively covers all database readers in that directory;
     locking the database inode itself would conflict with SQLite on macOS.
+    Read-only operations wait at most 30 seconds for maintenance before failing.
     """
     if read_only and exclusive:
         raise ValueError("a read-only database lease cannot be exclusive")
@@ -102,7 +124,12 @@ def database_lease(
         return
 
     if read_only:
-        with _path_lease(database.resolve().parent, exclusive=False, blocking=blocking):
+        with _path_lease(
+            database.resolve().parent,
+            exclusive=False,
+            blocking=blocking,
+            timeout_s=READ_ONLY_LEASE_TIMEOUT_SECONDS,
+        ):
             yield
         return
 

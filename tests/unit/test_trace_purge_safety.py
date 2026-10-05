@@ -75,6 +75,56 @@ def test_database_failure_cannot_bypass_active_session_guard(
     assert all(path.read_bytes() == b"active evidence" for path in paths)
 
 
+@pytest.mark.parametrize("session_artifact", ["nonempty", "empty", "missing"])
+def test_late_sql_failure_reports_files_reclaimed_by_storage(run_artifacts, session_artifact):
+    storage, sid, compiled, paths = run_artifacts
+    session = storage.base_trace_dir / sid
+    if session_artifact != "nonempty":
+        paths[0].unlink()
+    if session_artifact == "missing":
+        session.rmdir()
+    with storage._get_connection() as conn:
+        conn.execute("UPDATE sessions SET status='completed' WHERE session_id=?", (sid,))
+        conn.execute(
+            "CREATE TRIGGER block_session_delete BEFORE DELETE ON sessions "
+            "BEGIN SELECT RAISE(ABORT,'injected late SQL failure'); END"
+        )
+        conn.commit()
+
+    result = CliRunner().invoke(
+        trace_app,
+        [
+            "purge",
+            sid,
+            "--path",
+            str(storage.base_trace_dir),
+            "--trace-dir",
+            str(compiled),
+            "--json",
+        ],
+    )
+    reclaimed_session = session_artifact != "missing"
+    assert result.exit_code == (0 if reclaimed_session else 1), result.output
+    summary = json.loads(result.stdout.splitlines()[-1])
+    assert summary["status"] == ("purged" if reclaimed_session else "nothing_removed")
+    assert summary["cleanup_status"] == ("partial" if reclaimed_session else "failed")
+    assert summary["removed"] == ([str(session)] if reclaimed_session else [])
+    assert summary["bytes_reclaimed"] == (
+        len(b"active evidence") if session_artifact == "nonempty" else 0
+    )
+    assert "injected late SQL failure" in summary["errors"][0]
+    assert summary["diagnostics"][0]["sqlite_errorname"] == "SQLITE_CONSTRAINT_TRIGGER"
+    assert not session.exists()
+    # Reconciliation reports work StorageManager already performed. It must not
+    # authorize deleting the caller's remaining paths after the SQL failure.
+    assert all(path.read_bytes() == b"active evidence" for path in paths[1:])
+    with storage._get_connection() as conn:
+        assert (
+            conn.execute("SELECT status FROM sessions WHERE session_id=?", (sid,)).fetchone()[0]
+            == "completed"
+        )
+
+
 def test_missing_derived_database_is_rejected_without_creating_or_deleting_files(
     run_artifacts, tmp_path, monkeypatch
 ):

@@ -8,8 +8,10 @@ sizes, free space and page counts. A missing database is rejected without creati
 one. If initialization or a liveness check fails, artifacts are preserved. After
 inactivity is verified, storage may still reclaim that session's own files if a later
 SQL deletion fails; caller-supplied compiled paths are retained on database failure.
-Inspect `cleanup_status` and `errors` even if the legacy-compatible CLI
-exit code is zero after a partial cleanup.
+The summary includes files already reclaimed by storage, with `cleanup_status=partial`
+and exit code zero when anything was removed, even if the SQL transaction failed.
+Inspect `cleanup_status` and `errors`; exit code zero alone does not mean database
+rows were deleted. Already-missing paths do not count as reclaimed artifacts.
 
 Screenshots are retained until their last tracked session owner is removed. Legacy
 images remain conservatively unmanaged until idle maintenance inspects references.
@@ -40,8 +42,11 @@ held for the DataEngine lifetime and per storage operation. Read-only operations
 share a lock on the existing parent directory; maintenance holds that lock exclusively
 as well, preventing new readers from entering during cleanup or compaction. This
 conservatively coordinates all databases in the same directory without creating
-files for read-only clients. Schema initialization for maintenance happens only
-after acquiring the exclusive lease.
+files for read-only clients. Readers wait at most 30 seconds for that lease, then
+return a timeout asking the caller to retry trace inspection after maintenance.
+Maintenance still refuses immediately when another operation holds a conflicting
+lease. Schema initialization for maintenance happens only after acquiring the
+exclusive lease.
 
 With the companion Wayfinder ENG-2219 change, dispatched Apollo jobs use a separate
 workspace/database per run and delete the entire owned workspace after evidence

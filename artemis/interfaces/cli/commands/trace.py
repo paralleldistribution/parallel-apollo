@@ -229,7 +229,7 @@ def purge_trace(
         base_dir / f"{session_id}.artemis.log",
     ]
     targets.extend(leftovers)
-    planned = {str(t): _dir_size(t) for t in targets}
+    planned = {str(t): _dir_size(t) for t in targets if t.exists()}
 
     # Only successful session deletion proves the caller's extra artifact paths
     # can be reclaimed. Initialization/read failures must not bypass liveness.
@@ -260,7 +260,15 @@ def purge_trace(
                 removed.append(str(target))
         except (OSError, ValueError) as exc:
             errors.append(f"could not delete {target}: {exc!r}")
-    reclaimed += sum(size for path, size in planned.items() if not Path(path).exists())
+    # delete_session can remove its verified-inactive files even when later SQL
+    # fails. Reconcile those removals before choosing status/exit code, without
+    # treating already-missing paths as work or authorizing further deletion.
+    for path, size in planned.items():
+        target = Path(path)
+        if not target.exists() and not target.is_symlink():
+            reclaimed += size
+            if path not in removed:
+                removed.append(path)
     # Age alone cannot prove a shared screenshot is unused. Normal purge deletes
     # owned images; legacy pruning belongs to explicit idle maintenance.
     warnings = (

@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -57,10 +58,78 @@ def test_maintenance_conservatively_waits_for_other_database_readers_in_director
 
 
 @pytest.mark.skipif(os.name != "posix", reason="idle maintenance requires POSIX leases")
+def test_read_only_connection_timeout_closes_descriptor_without_opening_sqlite(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "data_engine.db"
+    storage = StorageManager(database, tmp_path)
+    reader = StorageManager(database, tmp_path, read_only=True)
+    monkeypatch.setattr(retention, "READ_ONLY_LEASE_TIMEOUT_SECONDS", 0.1)
+    descriptors, failures = [], []
+
+    def tracked_open(*args, **kwargs):
+        descriptor = os.open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def read():
+        try:
+            with reader._get_connection():
+                pass
+        except Exception as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=read, daemon=True)
+    with retention.database_lease(database, exclusive=True, blocking=False):
+        paths_before = set(tmp_path.iterdir())
+        database_before = database.read_bytes()
+        # Observe the actual descriptor without patching process-wide os.open.
+        monkeypatch.setattr(
+            retention,
+            "os",
+            SimpleNamespace(
+                **{
+                    name: getattr(os, name)
+                    for name in ("name", "O_RDONLY", "O_RDWR", "O_CREAT", "close")
+                },
+                open=tracked_open,
+            ),
+        )
+        with monkeypatch.context() as connection_patch:
+            connect = Mock(wraps=sqlite3.connect)
+            connection_patch.setattr(sqlite3, "connect", connect)
+            started = time.monotonic()
+            thread.start()
+            thread.join(2)
+            finished_under_contention = not thread.is_alive()
+            elapsed = time.monotonic() - started
+            connect.assert_not_called()
+        if finished_under_contention:
+            assert len(descriptors) == 1
+            with pytest.raises(OSError) as closed:
+                os.fstat(descriptors[0])
+            assert closed.value.errno == retention.errno.EBADF
+            assert set(tmp_path.iterdir()) == paths_before
+            assert database.read_bytes() == database_before
+    # Release maintenance even if the timeout regresses, so the test cannot
+    # strand a permanently blocked reader thread.
+    thread.join(2)
+    assert finished_under_contention
+    assert 0.1 <= elapsed < 2
+    assert len(failures) == 1 and isinstance(failures[0], TimeoutError)
+    assert "storage maintenance" in str(failures[0])
+    assert "retry trace inspection" in str(failures[0])
+    with reader._get_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    assert storage.maintain(compact=True)["compacted"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="idle maintenance requires POSIX leases")
 def test_reader_starting_after_maintenance_scan_waits_for_compaction(tmp_path, monkeypatch):
     database = tmp_path / "data_engine.db"
     storage = StorageManager(database, tmp_path)
     reader = StorageManager(database, tmp_path, read_only=True)
+    monkeypatch.setattr(retention, "READ_ONLY_LEASE_TIMEOUT_SECONDS", 2.0)
     scanned, finish_maintenance = threading.Event(), threading.Event()
     reader_started, reader_entered = threading.Event(), threading.Event()
     failures, results = [], []
