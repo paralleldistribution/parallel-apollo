@@ -759,6 +759,7 @@ def test_trace_purge_removes_the_run_and_reports_bytes(tmp_path, monkeypatch):
     import json as _json
 
     from artemis.config import settings as artemis_settings
+    from artemis.data_engine.storage import StorageManager
 
     traces = tmp_path / "traces"
     session_id = "5d1f0e0e-0000-4000-8000-000000000000"
@@ -777,6 +778,13 @@ def test_trace_purge_removes_the_run_and_reports_bytes(tmp_path, monkeypatch):
     os.utime(stale, (0, 0))
 
     monkeypatch.setattr(artemis_settings, "DATA_ENGINE_DB_PATH", tmp_path / "de.db", raising=False)
+    # --path selects an existing database; purge must never fabricate one.
+    storage = StorageManager(traces / "data_engine.db", traces)
+    with storage._get_connection() as conn:
+        conn.execute(
+            "INSERT INTO sessions(session_id,status) VALUES (?,?)", (session_id, "completed")
+        )
+        conn.commit()
 
     result = runner.invoke(
         app,
@@ -801,6 +809,9 @@ def test_trace_purge_removes_the_run_and_reports_bytes(tmp_path, monkeypatch):
     assert not trace_dir.exists()
     assert not (traces / session_id).exists()
     assert not (traces / f"{session_id}.result.json").exists()
-    # the shared image cache is pruned by age so a concurrent run keeps its own
-    assert not stale.exists()
+    # Age alone does not prove a screenshot is unused by another session.
+    assert summary["warnings"] == [
+        "shared image pruning deferred; use artemis trace maintenance while idle"
+    ]
+    assert stale.is_file()
     assert fresh.is_file()

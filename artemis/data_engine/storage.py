@@ -101,7 +101,7 @@ class StorageManager:
 
     @contextmanager
     def _get_connection(self) -> Iterator[sqlite3.Connection]:
-        with self._lock, nullcontext() if self.read_only else database_lease(self.db_path):
+        with self._lock, database_lease(self.db_path, read_only=self.read_only):
             if self.read_only:
                 conn = sqlite3.connect(
                     f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0
@@ -1251,9 +1251,10 @@ class StorageManager:
     def delete_session(self, session_id: UUID):
         """Delete one inactive session without compacting the shared database.
 
-        All SQL deletions commit together. File cleanup runs even when that
-        transaction fails; failure is propagated so callers cannot report a
-        successful database purge after silently skipping tables.
+        All SQL deletions commit together. Once liveness has been checked inside
+        the transaction, file cleanup can run even if subsequent SQL fails;
+        failure is propagated so callers cannot report a successful database
+        purge after silently skipping tables.
         """
         session_id_str = str(UUID(str(session_id)))
         video_paths = []
@@ -1275,14 +1276,14 @@ class StorageManager:
                 )
                 if row[0]
             }
-        allow_file_cleanup = True
+        allow_file_cleanup = False
         file_errors = []
         try:
             with self._get_connection() as conn, image_lease(self.db_path):
                 conn.execute("BEGIN IMMEDIATE")
                 if self._session_is_active(conn, session_id_str):
-                    allow_file_cleanup = False
                     raise ActiveSessionError("refusing to purge an active Artemis session")
+                allow_file_cleanup = True
                 candidates = [
                     row[0]
                     for row in conn.execute(

@@ -244,32 +244,8 @@ def _ensure_maestro_not_installed(device_id: str) -> None:
         _uninstall_package(device_id, MAESTRO_PACKAGE)
 
 
-def _release_stale_poco(device_id: str) -> bool:
-    """Bound recovery to Poco instrumentation on this device, never a global adb reset."""
-    try:
-        for package in ("com.netease.open.pocoservice", "com.netease.open.pocoservice.test"):
-            subprocess.run(
-                adb_command(["-s", device_id, "shell", "am", "force-stop", package]),
-                capture_output=True,
-                timeout=3,
-                check=True,
-            )
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            result = subprocess.run(
-                adb_command(["-s", device_id, "shell", "ps", "-A"]),
-                capture_output=True,
-                text=True,
-                timeout=1,
-                check=True,
-            )
-            if result.stdout.strip() and "pocoservice" not in result.stdout:
-                time.sleep(0.5)  # Android unregisters UiAutomation asynchronously
-                return True
-            time.sleep(0.2)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return False
+class UIAutomationConflictError(RuntimeError):
+    """Another instrumentation holds the device's UiAutomation registration."""
 
 
 class UIAutomatorClient:
@@ -330,11 +306,16 @@ class UIAutomatorClient:
                     f"UIAutomator2 connect attempt {attempt + 1}/3 to"
                     f" {self._device_id} failed: {exc}"
                 )
-                if attempt == 0 and "already registered" in str(exc):
-                    if not _release_stale_poco(self._device_id):
-                        raise RuntimeError(
-                            "UiAutomation remains occupied after bounded Poco teardown"
-                        ) from exc
+                if "already registered" in str(exc).lower():
+                    # A registration conflict does not identify its owner or
+                    # establish that it is stale. Device-wide teardown belongs
+                    # to the runner that coordinates exclusive device access.
+                    self._awake_strategy = None
+                    raise UIAutomationConflictError(
+                        f"UiAutomation conflict on {self._device_id}: another"
+                        " instrumentation is already registered; its owner must"
+                        " release it before this client can connect"
+                    ) from exc
         else:
             self._awake_strategy = None
             raise last_error
@@ -480,14 +461,13 @@ class UIAutomatorClient:
         )
 
     def disconnect(self) -> None:
-        """Disconnect this client without ending the host's awake lifetime."""
+        """Drop this proxy without stopping shared automation or awake services."""
         self._awake_strategy = None
-        device, self._device = self._device, None
-        if device is not None:
-            try:
-                device.stop_uiautomator(wait=True)
-            except Exception as exc:
-                logger.warning(f"Could not stop owned UIAutomator server: {exc}")
+        # u2.connect may attach to an existing server, and even a server it
+        # starts can be shared by later clients. This client has no exclusive
+        # ownership to stop it. Avoid device I/O here so broken connections can
+        # reconnect immediately instead of waiting on the dead proxy.
+        self._device = None
         logger.info("UIAutomator2 client disconnected")
 
 

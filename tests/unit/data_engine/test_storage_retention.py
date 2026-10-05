@@ -170,7 +170,8 @@ def test_idle_maintenance_removes_orphans_but_keeps_legacy_trace_references(stor
     assert count(storage, "history_chunks") == 1
 
 
-def test_purge_init_failure_still_reclaims_own_files_and_reports_diagnostics(tmp_path, monkeypatch):
+def test_purge_init_failure_preserves_files_and_reports_diagnostics(tmp_path, monkeypatch):
+    StorageManager(tmp_path / "data_engine.db", tmp_path)
     sid = uuid4()
     directory = tmp_path / str(sid)
     directory.mkdir()
@@ -185,12 +186,32 @@ def test_purge_init_failure_still_reclaims_own_files_and_reports_diagnostics(tmp
 
     monkeypatch.setattr("artemis.data_engine.storage.StorageManager", broken)
     result = CliRunner().invoke(trace_app, ["purge", str(sid), "--path", str(tmp_path), "--json"])
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     summary = json.loads(result.stdout.splitlines()[-1])
-    assert summary["cleanup_status"] == "partial"
+    assert summary["cleanup_status"] == "failed"
+    assert summary["removed"] == []
     assert summary["diagnostics"][0]["sqlite_errorname"] == "SQLITE_FULL"
-    assert not directory.exists()
+    assert directory.exists()
     assert unrelated.exists()
+
+
+def test_failure_rechecking_liveness_preserves_session_files(storage, monkeypatch):
+    sid = session(storage)
+    original = storage._session_is_active
+    checks = 0
+
+    def fail_second_check(conn, session_id):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise sqlite3.OperationalError("injected liveness check failure")
+        return original(conn, session_id)
+
+    monkeypatch.setattr(storage, "_session_is_active", fail_second_check)
+    with pytest.raises(sqlite3.OperationalError, match="liveness check failure"):
+        storage.delete_session(sid)
+    assert (storage.base_trace_dir / str(sid) / "evidence.txt").exists()
+    assert count(storage, "sessions") == count(storage, "history_chunks") == 1
 
 
 def test_purge_rejects_path_traversal_and_traces_root(storage):

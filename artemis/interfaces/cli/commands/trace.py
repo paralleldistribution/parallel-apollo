@@ -214,6 +214,11 @@ def purge_trace(
             typer.secho(message, fg=typer.colors.RED)
         raise typer.Exit(2)
 
+    if not database.is_file():
+        message = f"database does not exist: {database}; artifacts preserved"
+        typer.echo(json.dumps({"status": "rejected", "error": message}) if as_json else message)
+        raise typer.Exit(2)
+
     # Measure before deleting: the sizes are gone afterwards.
     session_dir = base_dir / session_id
     targets = [session_dir]
@@ -226,11 +231,14 @@ def purge_trace(
     targets.extend(leftovers)
     planned = {str(t): _dir_size(t) for t in targets}
 
-    # 1. Database rows + session directory + any video the DB knows about.
+    # Only successful session deletion proves the caller's extra artifact paths
+    # can be reclaimed. Initialization/read failures must not bypass liveness.
+    artifacts_verified = False
     try:
         storage = StorageManager(database, base_dir)
         storage.delete_session(UUID(session_id))
         removed.append("database rows")
+        artifacts_verified = True
     except ActiveSessionError as exc:
         typer.echo(json.dumps({"status": "rejected", "error": str(exc)}))
         raise typer.Exit(2)
@@ -238,9 +246,9 @@ def purge_trace(
         errors.append(f"database purge failed: {exc!r}")
         diagnostics.append(storage_diagnostics(database, exc))
 
-    # Reclaim each requested file independently, even if SQL initialization,
-    # deletion or the first filesystem target failed.
-    for target in dict.fromkeys(targets):
+    # StorageManager can reclaim known-inactive session files after a later SQL
+    # failure; keep caller-supplied paths whenever deletion could not be verified.
+    for target in dict.fromkeys(targets) if artifacts_verified else ():
         try:
             if target.is_symlink() or target.resolve().parent != base_dir:
                 raise ValueError(f"refusing unsafe artifact path: {target}")
@@ -281,6 +289,8 @@ def purge_trace(
         )
         for err in errors:
             typer.secho(f"  ! {err}", fg=typer.colors.YELLOW)
+        for warning in warnings:
+            typer.secho(f"  ! {warning}", fg=typer.colors.YELLOW)
 
     if not removed:
         raise typer.Exit(1)

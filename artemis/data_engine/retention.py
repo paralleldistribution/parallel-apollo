@@ -5,7 +5,7 @@ storage operations take shared leases. This prevents a maintenance check/start
 race even while an agent is between SQLite transactions.
 """
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import os
 from pathlib import Path
@@ -21,15 +21,15 @@ class ActiveSessionError(RuntimeError):
 def image_lease(database: Path):
     """Serialize image file writes/GC, including on Windows desktop clients."""
     if os.name != "nt":
-        with database_lease(Path(str(database) + ".images"), exclusive=True):
+        path = Path(str(database) + ".images.activity.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _path_lease(path, exclusive=True, blocking=True, create=True):
             yield
         return
     import msvcrt
     import time
 
     with Path(str(database) + ".images.activity.lock").open("a+b") as stream:
-        stream.write(b"\0")
-        stream.flush()
         deadline = time.monotonic() + 30
         while True:
             try:
@@ -41,6 +41,12 @@ def image_lease(database: Path):
                     raise
                 time.sleep(0.05)
         try:
+            # Byte-range locks may extend beyond EOF. Initialize only after
+            # acquiring the lock so concurrent first users cannot append twice.
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
             yield
         finally:
             stream.seek(0)
@@ -48,22 +54,16 @@ def image_lease(database: Path):
 
 
 @contextmanager
-def database_lease(database: Path, *, exclusive: bool = False, blocking: bool = True):
-    if os.name != "posix":
-        if exclusive:
-            raise RuntimeError("exclusive storage maintenance requires POSIX file locking")
-        yield
-        return
+def _path_lease(path: Path, *, exclusive: bool, blocking: bool, create: bool = False):
     import fcntl
 
-    path = Path(str(database) + ".activity.lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as stream:
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT if create else os.O_RDONLY, 0o666)
+    try:
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if not blocking:
             flags |= fcntl.LOCK_NB
         try:
-            fcntl.flock(stream, flags)
+            fcntl.flock(descriptor, flags)
         except BlockingIOError as exc:
             raise RuntimeError(
                 "database is in use; maintenance requires idle Artemis sessions"
@@ -71,7 +71,50 @@ def database_lease(database: Path, *, exclusive: bool = False, blocking: bool = 
         try:
             yield
         finally:
-            fcntl.flock(stream, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def database_lease(
+    database: Path,
+    *,
+    exclusive: bool = False,
+    blocking: bool = True,
+    read_only: bool = False,
+):
+    """Coordinate writers and read-only inspection with idle maintenance.
+
+    Writers lease the sidecar, including before SQLite creates the database.
+    Read-only inspection leases the existing parent directory instead, requiring
+    no writable files or directories. Maintenance holds both locks, preventing
+    either kind of operation from starting until maintenance has finished. The
+    directory lock conservatively covers all database readers in that directory;
+    locking the database inode itself would conflict with SQLite on macOS.
+    """
+    if read_only and exclusive:
+        raise ValueError("a read-only database lease cannot be exclusive")
+    if os.name != "posix":
+        if exclusive:
+            raise RuntimeError("exclusive storage maintenance requires POSIX file locking")
+        yield
+        return
+
+    if read_only:
+        with _path_lease(database.resolve().parent, exclusive=False, blocking=blocking):
+            yield
+        return
+
+    path = Path(str(database) + ".activity.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as leases:
+        leases.enter_context(_path_lease(path, exclusive=exclusive, blocking=blocking, create=True))
+        if exclusive:
+            leases.enter_context(
+                _path_lease(database.resolve().parent, exclusive=True, blocking=blocking)
+            )
+        yield
 
 
 def storage_diagnostics(
