@@ -9,12 +9,16 @@ one. If initialization or a liveness check fails, artifacts are preserved. After
 inactivity is verified, storage may still reclaim that session's own files if a later
 SQL deletion fails; caller-supplied compiled paths are retained on database failure.
 Storage and CLI file deletion share a per-command report populated only after a
-deletion succeeds. The summary includes those confirmed removals, with
+deletion succeeds. The summary includes those confirmed removals, including
+successfully deleted last-owner screenshots and their bytes, with
 `cleanup_status=partial` and exit code zero when anything was removed, even if the
 SQL transaction failed. Files disappearing during another cleanup do not turn a
 failed purge into success or contribute to its reclaimed-byte count.
 Inspect `cleanup_status` and `errors`; exit code zero alone does not mean database
 rows were deleted. Already-missing paths do not count as reclaimed artifacts.
+If another cleanup removes a target during deletion, that target contributes no
+bytes and cleanup continues with the remaining artifacts. Permission and other
+filesystem failures are still reported.
 
 Screenshots are retained until their last tracked session owner is removed. Legacy
 images remain conservatively unmanaged until idle maintenance inspects references.

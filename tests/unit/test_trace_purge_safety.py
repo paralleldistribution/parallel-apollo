@@ -1,17 +1,20 @@
 """Purge failures preserve files unless session inactivity was verified."""
 
+import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import sqlite3
 import threading
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from typer.testing import CliRunner
 
 from artemis.config import settings
+from artemis.data_engine.models import ImageRecord
 from artemis.data_engine.storage import StorageManager
 from artemis.interfaces.cli.commands.trace import trace_app
 
@@ -186,6 +189,103 @@ def test_concurrent_cleanup_is_not_credited_to_this_purge(
         assert paths[1].read_bytes() == b"active evidence"
     elif not removed_session:
         assert paths[0].read_bytes() == b"active evidence"
+
+
+@pytest.mark.parametrize("image_state", ["owned", "shared", "missing", "raced"])
+def test_purge_counts_only_successfully_deleted_owned_screenshots(
+    run_artifacts, monkeypatch, image_state
+):
+    storage, sid, compiled, paths = run_artifacts
+    with storage._get_connection() as conn:
+        conn.execute("UPDATE sessions SET status='completed' WHERE session_id=?", (sid,))
+        conn.commit()
+    data = b"owned screenshot bytes"
+    name = hashlib.sha256(data).hexdigest()
+    image = ImageRecord(image_name=name)
+    storage.store_session_image(image, UUID(sid), data)
+    image_path = storage.base_trace_dir / "images" / f"{name}.jpg"
+    if image_state == "shared":
+        other = uuid4()
+        with storage._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO sessions(session_id,status) VALUES (?,?)", (str(other), "completed")
+            )
+            conn.commit()
+        storage.store_session_image(image, other, data)
+    elif image_state == "missing":
+        image_path.unlink()
+    elif image_state == "raced":
+        original_unlink = Path.unlink
+
+        def other_cleanup_wins(path, *args, **kwargs):
+            if path == image_path:
+                original_unlink(path)
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", other_cleanup_wins)
+
+    artifact_bytes = sum(path.stat().st_size for path in paths)
+    result = CliRunner().invoke(
+        trace_app,
+        [
+            "purge",
+            sid,
+            "--path",
+            str(storage.base_trace_dir),
+            "--trace-dir",
+            str(compiled),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.stdout.splitlines()[-1])
+    assert summary["cleanup_status"] == "complete"
+    assert summary["errors"] == []
+    assert summary["bytes_reclaimed"] == artifact_bytes + (
+        len(data) if image_state == "owned" else 0
+    )
+    assert (str(image_path) in summary["removed"]) == (image_state == "owned")
+    assert image_path.exists() == (image_state == "shared")
+    assert all(not path.exists() for path in paths)
+
+
+def test_purge_continues_leftover_cleanup_after_another_actor_removes_session(
+    run_artifacts, monkeypatch
+):
+    storage, sid, compiled, paths = run_artifacts
+    with storage._get_connection() as conn:
+        conn.execute("UPDATE sessions SET status='completed' WHERE session_id=?", (sid,))
+        conn.commit()
+    session = storage.base_trace_dir / sid
+    original_rmtree = shutil.rmtree
+
+    def other_cleanup_wins(path, *args, **kwargs):
+        if path == session:
+            original_rmtree(path)
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", other_cleanup_wins)
+    remaining_bytes = sum(path.stat().st_size for path in paths[1:])
+    result = CliRunner().invoke(
+        trace_app,
+        [
+            "purge",
+            sid,
+            "--path",
+            str(storage.base_trace_dir),
+            "--trace-dir",
+            str(compiled),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.stdout.splitlines()[-1])
+    assert summary["cleanup_status"] == "complete"
+    assert summary["errors"] == []
+    assert summary["bytes_reclaimed"] == remaining_bytes
+    assert str(session) not in summary["removed"]
+    assert "database rows" in summary["removed"]
+    assert all(not path.exists() for path in paths)
 
 
 def test_missing_derived_database_is_rejected_without_creating_or_deleting_files(

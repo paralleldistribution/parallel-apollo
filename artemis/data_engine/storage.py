@@ -1334,7 +1334,9 @@ class StorageManager:
                 # The image lease remains held across commit and file removal.
                 # A concurrent capture cannot recreate a file just before GC.
                 for name in removed_images:
-                    (self.base_trace_dir / "images" / f"{name}.jpg").unlink(missing_ok=True)
+                    cleanup_report.remove(
+                        self.base_trace_dir / "images" / f"{name}.jpg", recursive=False
+                    )
         finally:
             if allow_file_cleanup:
                 file_errors = self._delete_session_files(
