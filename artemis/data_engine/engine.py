@@ -14,6 +14,7 @@
 
 import asyncio
 from collections.abc import Callable
+from contextlib import ExitStack
 import functools
 import hashlib
 import json
@@ -39,6 +40,7 @@ from artemis.data_engine.models import (
     VideoRecordingRecord,
 )
 from artemis.data_engine.storage import StorageManager
+from artemis.data_engine.retention import database_lease
 from artemis.data_engine.trace import CURRENT_TRACE_ID
 from artemis.utils.coordinates import (
     normalize_any_structure,
@@ -403,7 +405,10 @@ class DataEngine:
             self.global_base_dir = settings.TRACES_PATH
             self.db_path = settings.DATA_ENGINE_DB_PATH
 
-        self.storage = StorageManager(self.db_path, self.global_base_dir)
+        with ExitStack() as leases:
+            leases.enter_context(database_lease(self.db_path))
+            self.storage = StorageManager(self.db_path, self.global_base_dir)
+            self._storage_lease = leases.pop_all()
 
         self.current_session_id: UUID | None = None
         self.session_start_time: float | None = None
@@ -799,29 +804,15 @@ class DataEngine:
         hasher.update(image_bytes)
         image_name = hasher.hexdigest()
 
-        image_record = self.storage.get_image(image_name)
-        if image_record:
-            # If the image exists but is missing OCR or UI tree, and we now have them, update the record.
-            if (ocr_result is not None and image_record.ocr_result is None) or (
-                ui_tree is not None and image_record.ui_tree is None
-            ):
-                self.storage.update_image_data(image_name, ocr_result, ui_tree)
-            return image_name
-
-        images_dir = self.global_base_dir / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        file_path = images_dir / f"{image_name}.jpg"
-
-        with open(file_path, "wb") as f:
-            f.write(image_bytes)
-
-        new_record = ImageRecord(
-            image_name=image_name,
-            ui_tree=ui_tree,
-            ocr_result=ocr_result,
-            extra_metadata={},
+        # Ownership is recorded even on a cache hit. If an older purge removed
+        # the file while retaining its row, store_session_image restores it.
+        self.storage.store_session_image(
+            ImageRecord(
+                image_name=image_name, ui_tree=ui_tree, ocr_result=ocr_result, extra_metadata={}
+            ),
+            self.current_session_id,
+            image_bytes,
         )
-        self.storage.create_image(new_record)
 
         return image_name
 
@@ -1091,6 +1082,9 @@ class DataEngine:
                     pass
                 self.ipc_socket = None
 
+        if self._storage_lease is not None:
+            self._storage_lease.__exit__(None, None, None)
+            self._storage_lease = None
         logger.info("DataEngine shutdown complete. All data persisted.")
 
     def stream_output(

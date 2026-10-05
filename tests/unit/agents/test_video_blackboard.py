@@ -269,6 +269,7 @@ def test_session_deletion_removes_video_blackboard_rows(tmp_path):
     board.add_observation({"start": 0.0, "end": 1.0, "target": "cleanup", "summary": "evidence"})
     assert board.list_observations()
 
+    engine.end_session()
     engine.storage.delete_session(session_id)
 
     reopened = VideoBlackboard(f"video:{video_id}", db_path=engine.storage.db_path)

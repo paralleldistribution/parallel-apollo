@@ -244,6 +244,10 @@ def _ensure_maestro_not_installed(device_id: str) -> None:
         _uninstall_package(device_id, MAESTRO_PACKAGE)
 
 
+class UIAutomationConflictError(RuntimeError):
+    """Another instrumentation holds the device's UiAutomation registration."""
+
+
 class UIAutomatorClient:
     """UIAutomator2 client for Android screen data retrieval.
 
@@ -277,7 +281,7 @@ class UIAutomatorClient:
                 return self._device
             except Exception:
                 logger.warning("UIAutomator2 connection lost, reconnecting...")
-                self._device = None
+                self.disconnect()
 
         # Ensure Maestro is not blocking us
         _ensure_maestro_not_installed(self._device_id)
@@ -302,6 +306,16 @@ class UIAutomatorClient:
                     f"UIAutomator2 connect attempt {attempt + 1}/3 to"
                     f" {self._device_id} failed: {exc}"
                 )
+                if "already registered" in str(exc).lower():
+                    # A registration conflict does not identify its owner or
+                    # establish that it is stale. Device-wide teardown belongs
+                    # to the runner that coordinates exclusive device access.
+                    self._awake_strategy = None
+                    raise UIAutomationConflictError(
+                        f"UiAutomation conflict on {self._device_id}: another"
+                        " instrumentation is already registered; its owner must"
+                        " release it before this client can connect"
+                    ) from exc
         else:
             self._awake_strategy = None
             raise last_error
@@ -447,8 +461,12 @@ class UIAutomatorClient:
         )
 
     def disconnect(self) -> None:
-        """Disconnect this client without ending the host's awake lifetime."""
+        """Drop this proxy without stopping shared automation or awake services."""
         self._awake_strategy = None
+        # u2.connect may attach to an existing server, and even a server it
+        # starts can be shared by later clients. This client has no exclusive
+        # ownership to stop it. Avoid device I/O here so broken connections can
+        # reconnect immediately instead of waiting on the dead proxy.
         self._device = None
         logger.info("UIAutomator2 client disconnected")
 
