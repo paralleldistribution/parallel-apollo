@@ -13,13 +13,15 @@
 # limitations under the License.
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import difflib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
 import threading
+import tempfile
 from typing import Any
 import uuid
 from uuid import UUID
@@ -35,6 +37,12 @@ from artemis.data_engine.models import (
     VideoRecordingRecord,
 )
 from artemis.utils.logger import get_logger
+from artemis.data_engine.retention import (
+    ActiveSessionError,
+    database_lease,
+    image_lease,
+    storage_diagnostics,
+)
 
 
 def _safe_uuid(val: Any) -> UUID | str:
@@ -64,7 +72,14 @@ logger = get_logger(__name__)
 class StorageManager:
     """Manages persistence for Data Engine using SQLite and File System."""
 
-    def __init__(self, db_path: str | Path, base_trace_dir: str | Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: str | Path,
+        base_trace_dir: str | Path,
+        *,
+        read_only: bool = False,
+        initialize: bool = True,
+    ):
         self.db_path = Path(db_path)
         self.base_trace_dir = Path(base_trace_dir)
         self._lock = threading.RLock()
@@ -81,11 +96,12 @@ class StorageManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.base_trace_dir.mkdir(parents=True, exist_ok=True)
 
-        self._init_db()
+        if initialize:
+            self._init_db()
 
     @contextmanager
     def _get_connection(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
+        with self._lock, nullcontext() if self.read_only else database_lease(self.db_path):
             if self.read_only:
                 conn = sqlite3.connect(
                     f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0
@@ -95,13 +111,22 @@ class StorageManager:
             conn.row_factory = sqlite3.Row
             try:
                 yield conn
+            except sqlite3.Error as exc:
+                diagnostics = storage_diagnostics(self.db_path, exc, connection=conn)
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass  # Preserve the original failure if rollback also fails.
+                logger.error(f"SQLite operation failed: {diagnostics}")
+                raise
             finally:
                 conn.close()
 
-    def _init_db(self):
+    def _init_db(self, connection=None):
         """Initialize database tables."""
-        with self._get_connection() as conn:
+        with self._get_connection() if connection is None else nullcontext(connection) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
@@ -114,15 +139,13 @@ class StorageManager:
                 )
             """)
 
-            try:
+            if "video_filepath" not in {
+                row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+            }:
                 conn.execute("ALTER TABLE sessions ADD COLUMN video_filepath TEXT")
-            except sqlite3.OperationalError:
-                pass
 
-            try:
+            if "pid" not in {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}:
                 conn.execute("ALTER TABLE sessions ADD COLUMN pid INTEGER")
-            except sqlite3.OperationalError:
-                pass
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS images (
@@ -153,25 +176,23 @@ class StorageManager:
                     FOREIGN KEY(post_image_name) REFERENCES images(image_name)
                 )
             """)
-            try:
+            if "action_taken" not in {row[1] for row in conn.execute("PRAGMA table_info(steps)")}:
                 conn.execute("ALTER TABLE steps ADD COLUMN action_taken TEXT")
-            except sqlite3.OperationalError:
-                pass
 
-            try:
+            if "operator_raw_thinking" not in {
+                row[1] for row in conn.execute("PRAGMA table_info(steps)")
+            }:
                 conn.execute("ALTER TABLE steps ADD COLUMN operator_raw_thinking TEXT")
-            except sqlite3.OperationalError:
-                pass
 
-            try:
+            if "operator_native_thinking" not in {
+                row[1] for row in conn.execute("PRAGMA table_info(steps)")
+            }:
                 conn.execute("ALTER TABLE steps ADD COLUMN operator_native_thinking TEXT")
-            except sqlite3.OperationalError:
-                pass
 
-            try:
+            if "last_execution_result" not in {
+                row[1] for row in conn.execute("PRAGMA table_info(steps)")
+            }:
                 conn.execute("ALTER TABLE steps ADD COLUMN last_execution_result TEXT")
-            except sqlite3.OperationalError:
-                pass
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS traces (
@@ -265,10 +286,34 @@ class StorageManager:
                 )
             if "error" not in video_recording_columns:
                 conn.execute("ALTER TABLE video_recordings ADD COLUMN error TEXT")
-            try:
+            if "logs" not in {
+                row[1] for row in conn.execute("PRAGMA table_info(background_tasks)")
+            }:
                 conn.execute("ALTER TABLE background_tasks ADD COLUMN logs TEXT")
-            except sqlite3.OperationalError:
-                pass
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(images)")}
+            if "gc_managed" not in columns:
+                conn.execute("ALTER TABLE images ADD COLUMN gc_managed INTEGER NOT NULL DEFAULT 0")
+            conn.execute("""CREATE TABLE IF NOT EXISTS session_images (
+                session_id TEXT NOT NULL, image_name TEXT NOT NULL,
+                PRIMARY KEY (session_id, image_name))""")
+            for table in (
+                "steps",
+                "traces",
+                "failed_outputs",
+                "background_tasks",
+                "history_chunks",
+                "video_recordings",
+            ):
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_session ON {table}(session_id)"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_images_image ON session_images(image_name)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_steps_pre_image ON steps(pre_image_name)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_steps_post_image ON steps(post_image_name)"
+            )
             conn.commit()
         logger.info(f"Database initialized at {self.db_path}")
 
@@ -424,6 +469,48 @@ class StorageManager:
                     json.dumps(image.extra_metadata),
                 ),
             )
+            conn.commit()
+
+    def store_session_image(
+        self, image: ImageRecord, session_id: UUID | None, image_bytes: bytes
+    ) -> None:
+        """Atomically register ownership; serialize file replacement with image GC.
+
+        Legacy rows remain unmanaged until explicit idle maintenance has checked
+        their references. Reusing one must not make another old session lose it.
+        """
+        image_dir = self.base_trace_dir / "images"
+        with self._get_connection() as conn, image_lease(self.db_path):
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO images(image_name,timestamp,ocr_result,ui_tree,extra_metadata,gc_managed)
+                   VALUES (?,?,?,?,?,?) ON CONFLICT(image_name) DO UPDATE SET
+                   ocr_result=COALESCE(images.ocr_result,excluded.ocr_result),
+                   ui_tree=COALESCE(images.ui_tree,excluded.ui_tree)""",
+                (
+                    image.image_name,
+                    image.timestamp,
+                    json.dumps(image.ocr_result) if image.ocr_result is not None else None,
+                    json.dumps(image.ui_tree) if image.ui_tree is not None else None,
+                    json.dumps(image.extra_metadata),
+                    int(session_id is not None),
+                ),
+            )
+            if session_id is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_images VALUES (?,?)",
+                    (str(session_id), image.image_name),
+                )
+            image_dir.mkdir(parents=True, exist_ok=True)
+            destination = image_dir / f"{image.image_name}.jpg"
+            if not destination.is_file() or destination.stat().st_size == 0:
+                fd, temporary = tempfile.mkstemp(prefix=".image-", dir=image_dir)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(image_bytes)
+                    os.replace(temporary, destination)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
             conn.commit()
 
     def get_image(self, image_name: str) -> ImageRecord | None:
@@ -1090,6 +1177,9 @@ class StorageManager:
             tables = [
                 "video_analysis_observations",
                 "video_analysis_segments",
+                "history_chunks",
+                "session_images",
+                "video_recordings",
                 "failed_outputs",
                 "traces",
                 "background_tasks",
@@ -1103,9 +1193,7 @@ class StorageManager:
                 except sqlite3.OperationalError as e:
                     logger.warning(f"Failed to clear table {table}: {e}")
             conn.commit()
-            conn.execute("VACUUM")
-            conn.commit()
-        logger.info("Database tables cleared and vacuumed.")
+        logger.info("Database tables cleared; compaction is explicit maintenance.")
 
         # Delete session directories
         if self.base_trace_dir.exists():
@@ -1140,106 +1228,254 @@ class StorageManager:
         except ValueError:
             return False
 
-    def delete_session(self, session_id: UUID):
-        """Delete all data associated with a session, including files on disk."""
-        session_id_str = str(session_id)
+    def _session_is_active(self, conn, session_id: str) -> bool:
+        import psutil
+        import time
 
-        # 1. Get video paths before deleting from DB
-        video_paths = []
-        video_ids: list[str] = []
+        row = conn.execute(
+            "SELECT status,pid,start_time FROM sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if not row or row["status"] != "running" or not row["pid"]:
+            return False
         try:
-            with self._get_connection() as conn:
-                cursor = conn.execute(
-                    "SELECT video_id, local_video_path FROM video_recordings WHERE session_id = ?",
+            process = psutil.Process(row["pid"])
+            return (
+                process.is_running()
+                and process.create_time() <= (row["start_time"] or time.time()) + 5
+            )
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            return True
+
+    def delete_session(self, session_id: UUID):
+        """Delete one inactive session without compacting the shared database.
+
+        All SQL deletions commit together. File cleanup runs even when that
+        transaction fails; failure is propagated so callers cannot report a
+        successful database purge after silently skipping tables.
+        """
+        session_id_str = str(UUID(str(session_id)))
+        video_paths = []
+        with self._get_connection() as conn:
+            if self._session_is_active(conn, session_id_str):
+                raise ActiveSessionError("refusing to purge an active Artemis session")
+            videos = conn.execute(
+                "SELECT video_id,local_video_path FROM video_recordings WHERE session_id=?",
+                (session_id_str,),
+            ).fetchall()
+            video_paths = [
+                Path(row["local_video_path"]) for row in videos if row["local_video_path"]
+            ]
+            other_video_paths = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT local_video_path FROM video_recordings WHERE session_id<>?",
                     (session_id_str,),
                 )
-                for row in cursor.fetchall():
-                    if row["video_id"]:
-                        video_ids.append(str(row["video_id"]))
-                    if row["local_video_path"]:
-                        video_paths.append(Path(row["local_video_path"]))
-        except sqlite3.OperationalError as e:
-            logger.warning(f"Could not query video_recordings: {e}")
-
-        # 2. Delete from DB tables
-        with self._get_connection() as conn:
-            conn.execute("PRAGMA foreign_keys = OFF")
-            board_keys = [f"session:{session_id_str}"] + [
-                f"video:{video_id}" for video_id in video_ids
-            ]
-            for table in (
-                "video_analysis_observations",
-                "video_analysis_segments",
-            ):
-                try:
-                    conn.executemany(
-                        f"DELETE FROM {table} WHERE board_key = ?",
-                        [(key,) for key in board_keys],
-                    )
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"Failed to delete video memory from {table}: {e}")
-            tables = [
-                "failed_outputs",
-                "traces",
-                "background_tasks",
-                "video_recordings",
-                "steps",
-                "sessions",
-            ]
-            for table in tables:
-                try:
-                    conn.execute(
-                        f"DELETE FROM {table} WHERE session_id = ?",
+                if row[0]
+            }
+        allow_file_cleanup = True
+        file_errors = []
+        try:
+            with self._get_connection() as conn, image_lease(self.db_path):
+                conn.execute("BEGIN IMMEDIATE")
+                if self._session_is_active(conn, session_id_str):
+                    allow_file_cleanup = False
+                    raise ActiveSessionError("refusing to purge an active Artemis session")
+                candidates = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT image_name FROM session_images WHERE session_id=?",
                         (session_id_str,),
                     )
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"Failed to delete from table {table}: {e}")
-            conn.commit()
-            conn.execute("VACUUM")
-            conn.commit()
+                ]
+                tables = {
+                    row[0]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                }
+                board_keys = [f"session:{session_id_str}"] + [
+                    f"video:{row['video_id']}" for row in videos
+                ]
+                for table in ("video_analysis_observations", "video_analysis_segments"):
+                    if table in tables:  # optional video subsystem tables
+                        conn.executemany(
+                            f"DELETE FROM {table} WHERE board_key=?", [(key,) for key in board_keys]
+                        )
+                for table in (
+                    "history_chunks",
+                    "session_images",
+                    "failed_outputs",
+                    "traces",
+                    "background_tasks",
+                    "video_recordings",
+                    "steps",
+                    "sessions",
+                ):
+                    conn.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id_str,))
+                removed_images = []
+                for name in candidates:
+                    cursor = conn.execute(
+                        """DELETE FROM images WHERE image_name=? AND gc_managed=1
+                        AND NOT EXISTS (SELECT 1 FROM session_images WHERE image_name=?)
+                        AND NOT EXISTS (SELECT 1 FROM steps WHERE pre_image_name=? OR post_image_name=?)""",
+                        (name, name, name, name),
+                    )
+                    if cursor.rowcount:
+                        removed_images.append(name)
+                conn.commit()
+                # The image lease remains held across commit and file removal.
+                # A concurrent capture cannot recreate a file just before GC.
+                for name in removed_images:
+                    (self.base_trace_dir / "images" / f"{name}.jpg").unlink(missing_ok=True)
+        finally:
+            if allow_file_cleanup:
+                file_errors = self._delete_session_files(
+                    session_id_str, video_paths, other_video_paths
+                )
+        if file_errors:
+            raise OSError("session artifact cleanup incomplete: " + "; ".join(file_errors))
+        logger.info(f"Database records for session {session_id} cleared (no VACUUM).")
 
-        logger.info(f"Database records for session {session_id} cleared.")
-
-        # 3. Delete session directory (notes, etc.)
-        session_dir = self.base_trace_dir / session_id_str
-        if session_dir.exists() and session_dir.is_dir():
+    def _delete_session_files(self, session_id: str, video_paths: list[Path], protected: set[str]):
+        base = self.base_trace_dir.resolve()
+        targets = {base / session_id}
+        for video in video_paths:
             try:
-                shutil.rmtree(session_dir)
-                logger.info(f"Deleted session directory: {session_dir}")
-            except Exception as e:
-                logger.error(f"Failed to delete session directory {session_dir}: {e}")
+                video.resolve().relative_to(base)
+            except ValueError:
+                continue
+            if str(video) in protected or video.parent.resolve() == base:
+                continue
+            name = video.parent.name
+            for candidate in base.iterdir():
+                if candidate.name == name or any(
+                    candidate.name.startswith(name + suffix)
+                    for suffix in ("_PASS_", "_FAIL_", "_CANCELLED_")
+                ):
+                    if not any(
+                        Path(value).parent.resolve() == candidate.resolve() for value in protected
+                    ):
+                        targets.add(candidate)
+        errors = []
+        for path in targets:
+            try:
+                if path.is_symlink() or path.resolve().parent != base:
+                    raise ValueError(f"refusing unsafe artifact path: {path}")
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            except (OSError, ValueError) as exc:
+                errors.append(str(exc))
+        if errors:
+            logger.error(f"Session file cleanup incomplete: {errors}")
+        return errors
 
-        # 4. Delete video files and their containing folders (which might have been renamed)
-        for video_path in video_paths:
-            # video_path is likely: /path/to/traces/task_name/recording.mp4
-            # If it was renamed, it might be: /path/to/traces/task_name_PASS_timestamp/recording.mp4
+    def maintain(self, *, compact: bool = False, image_min_age_s: float = 21600) -> dict:
+        """Explicit idle-only cleanup for legacy rows and optional compaction."""
+        import re
+        import time
+        import psutil
 
-            task_name = video_path.parent.name
-
-            if task_name and task_name != "traces" and task_name != "..":
-                # Search for directories starting with task_name in base_trace_dir
+        if self.read_only:
+            raise PermissionError("maintenance requires writable storage")
+        summary = {"history_chunks_removed": 0, "images_removed": 0, "compacted": False}
+        with database_lease(self.db_path, exclusive=True, blocking=False):
+            # Also protect sessions opened by older versions without activity leases.
+            with closing(sqlite3.connect(self.db_path, timeout=2)) as check:
+                check.row_factory = sqlite3.Row
+                ids = [
+                    row[0]
+                    for row in check.execute(
+                        "SELECT session_id FROM sessions WHERE status='running'"
+                    )
+                ]
+                if any(self._session_is_active(check, sid) for sid in ids):
+                    raise RuntimeError("database has active sessions; maintenance refused")
+            for process in psutil.process_iter(["pid"]):
+                if process.pid == os.getpid():
+                    continue
                 try:
-                    for path in self.base_trace_dir.iterdir():
-                        if path.is_dir() and path.name.startswith(task_name):
-                            try:
-                                shutil.rmtree(path)
-                                logger.info(f"Deleted trace/video directory: {path}")
-                            except Exception as e:
-                                logger.error(f"Failed to delete directory {path}: {e}")
-                        elif path.is_file() and path.name.startswith(task_name):
-                            try:
-                                path.unlink()
-                                logger.info(f"Deleted trace/video file: {path}")
-                            except Exception as e:
-                                logger.error(f"Failed to delete file {path}: {e}")
-                except Exception as e:
-                    logger.error(f"Error iterating base_trace_dir for cleanup: {e}")
-
-            if video_path.exists():
-                try:
-                    video_path.unlink()
-                    logger.info(f"Deleted video file directly: {video_path}")
-                    if video_path.parent.exists() and not any(video_path.parent.iterdir()):
-                        video_path.parent.rmdir()
-                except Exception as e:
-                    logger.error(f"Failed to delete video file directly {video_path}: {e}")
+                    if any(Path(f.path) == self.db_path.resolve() for f in process.open_files()):
+                        raise RuntimeError(
+                            "database has open readers or writers; maintenance refused"
+                        )
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            conn = sqlite3.connect(self.db_path, timeout=2)
+            try:
+                self._init_db(connection=conn)
+                conn.execute(
+                    "DELETE FROM session_images WHERE session_id NOT IN (SELECT session_id FROM sessions)"
+                )
+                conn.commit()
+                while True:
+                    cursor = conn.execute("""DELETE FROM history_chunks WHERE rowid IN (
+                        SELECT h.rowid FROM history_chunks h LEFT JOIN sessions s ON s.session_id=h.session_id
+                        WHERE s.session_id IS NULL LIMIT 500)""")
+                    conn.commit()
+                    summary["history_chunks_removed"] += cursor.rowcount
+                    if not cursor.rowcount:
+                        break
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                referenced = {
+                    row[0] for row in conn.execute("SELECT image_name FROM session_images")
+                }
+                for row in conn.execute("SELECT pre_image_name,post_image_name FROM steps"):
+                    referenced.update(name for name in row if name)
+                # Legacy traces may reference images outside pre/post screenshots.
+                # Stream these fields; never materialize the multi-GB trace table.
+                for query in (
+                    "SELECT payload FROM traces",
+                    "SELECT action_taken,last_execution_result,extra_metadata FROM steps",
+                    "SELECT band1,band2,band3,rendered_text FROM history_chunks",
+                ):
+                    for row in conn.execute(query):
+                        for value in row:
+                            if isinstance(value, str):
+                                referenced.update(
+                                    name.lower()
+                                    for name in re.findall(
+                                        r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", value, re.I
+                                    )
+                                )
+                cutoff = time.time() - max(0, image_min_age_s)
+                candidates = conn.execute(
+                    "SELECT image_name FROM images WHERE timestamp<?", (cutoff,)
+                ).fetchall()
+                for (name,) in candidates:
+                    if name in referenced:
+                        continue
+                    conn.execute("DELETE FROM images WHERE image_name=?", (name,))
+                    conn.commit()
+                    (self.base_trace_dir / "images" / f"{name}.jpg").unlink(missing_ok=True)
+                    summary["images_removed"] += 1
+                    if summary["images_removed"] % 500 == 0:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                for image in (self.base_trace_dir / "images").glob("*.jpg"):
+                    if (
+                        not image.is_symlink()
+                        and re.fullmatch(r"[0-9a-f]{64}", image.stem)
+                        and image.stem not in referenced
+                        and image.stat().st_mtime < cutoff
+                        and not conn.execute(
+                            "SELECT 1 FROM images WHERE image_name=?", (image.stem,)
+                        ).fetchone()
+                    ):
+                        image.unlink()
+                if compact:
+                    if (
+                        shutil.disk_usage(self.db_path.parent).free
+                        < 2 * self.db_path.stat().st_size
+                    ):
+                        raise RuntimeError(
+                            "insufficient free space for VACUUM; require twice the database size"
+                        )
+                    if conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                        raise RuntimeError("database acquired a reader; compaction refused")
+                    conn.execute("VACUUM")
+                    summary["compacted"] = True
+            finally:
+                conn.close()
+        return summary

@@ -18,6 +18,7 @@ import datetime
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import time
 from typing import Annotated
 from uuid import UUID
@@ -165,13 +166,7 @@ def purge_trace(
         float,
         typer.Option(
             "--prune-images-older-than",
-            help=(
-                "Also delete files in the shared traces/images cache last modified"
-                " more than this many seconds ago. That cache is global and"
-                " content-addressed, so it is pruned by age rather than by session:"
-                " an age floor leaves a concurrently running job's working set"
-                " alone. 0 disables image pruning."
-            ),
+            help=("Deprecated: shared image pruning now requires idle trace maintenance."),
         ),
     ] = 0.0,
     traces_path: Annotated[
@@ -186,8 +181,7 @@ def purge_trace(
     """Delete every artifact of one finished session and report what was reclaimed.
 
     Intended for a caller that has already copied the evidence somewhere durable
-    (parallel-wayfinder's `apollo` workflow uploads it to Supabase, then calls
-    this). It removes the session's database rows, its session directory, its
+    before deleting local copies. It removes the session's database rows, its session directory, its
     compiled trace directory including `recording.mp4`, and the per-session
     leftovers at the traces root.
 
@@ -196,12 +190,23 @@ def purge_trace(
     """
     from artemis.data_engine.storage import StorageManager
 
-    base_dir = traces_path or Path(settings.TRACES_PATH)
+    from artemis.data_engine.retention import ActiveSessionError, storage_diagnostics
+
+    base_dir = (traces_path or Path(settings.TRACES_PATH)).resolve()
+    database = (
+        base_dir / "data_engine.db" if traces_path is not None else settings.DATA_ENGINE_DB_PATH
+    )
+    try:
+        session_id = str(UUID(session_id))
+    except ValueError:
+        typer.echo(json.dumps({"status": "rejected", "error": "session_id must be a UUID"}))
+        raise typer.Exit(2)
+    diagnostics = []
     reclaimed = 0
     removed: list[str] = []
     errors: list[str] = []
 
-    if trace_dir is not None and not _is_within(trace_dir, base_dir):
+    if trace_dir is not None and (trace_dir.is_symlink() or trace_dir.resolve().parent != base_dir):
         message = f"--trace-dir {trace_dir} is outside the traces directory {base_dir}"
         if as_json:
             typer.echo(json.dumps({"status": "rejected", "error": message}))
@@ -223,54 +228,45 @@ def purge_trace(
 
     # 1. Database rows + session directory + any video the DB knows about.
     try:
-        storage = StorageManager(settings.DATA_ENGINE_DB_PATH, base_dir)
+        storage = StorageManager(database, base_dir)
         storage.delete_session(UUID(session_id))
         removed.append("database rows")
-    except ValueError:
-        errors.append(f"{session_id!r} is not a valid UUID")
+    except ActiveSessionError as exc:
+        typer.echo(json.dumps({"status": "rejected", "error": str(exc)}))
+        raise typer.Exit(2)
     except Exception as exc:  # noqa: BLE001 — reclaiming disk must not raise
         errors.append(f"database purge failed: {exc!r}")
+        diagnostics.append(storage_diagnostics(database, exc))
 
-    # 2. The compiled trace directory. delete_session only finds it when a video
-    #    row exists, so remove the caller's resolved path explicitly too.
-    if trace_dir is not None and trace_dir.exists():
+    # Reclaim each requested file independently, even if SQL initialization,
+    # deletion or the first filesystem target failed.
+    for target in dict.fromkeys(targets):
         try:
-            shutil.rmtree(trace_dir)
-            removed.append(str(trace_dir))
-        except OSError as exc:
-            errors.append(f"could not delete {trace_dir}: {exc!r}")
-
-    # 3. Per-session leftovers at the traces root.
-    for leftover in leftovers:
-        if leftover.exists():
-            try:
-                leftover.unlink()
-                removed.append(str(leftover))
-            except OSError as exc:
-                errors.append(f"could not delete {leftover}: {exc!r}")
-
+            if target.is_symlink() or target.resolve().parent != base_dir:
+                raise ValueError(f"refusing unsafe artifact path: {target}")
+            if target.is_dir():
+                shutil.rmtree(target)
+                removed.append(str(target))
+            elif target.exists():
+                target.unlink()
+                removed.append(str(target))
+        except (OSError, ValueError) as exc:
+            errors.append(f"could not delete {target}: {exc!r}")
     reclaimed += sum(size for path, size in planned.items() if not Path(path).exists())
-
-    # 4. The shared image cache, by age.
-    images_removed = 0
-    if prune_images_older_than > 0:
-        images_dir = base_dir / "images"
-        cutoff = time.time() - prune_images_older_than
-        for image in images_dir.rglob("*") if images_dir.exists() else []:
-            try:
-                if image.is_file() and image.stat().st_mtime < cutoff:
-                    size = image.stat().st_size
-                    image.unlink()
-                    images_removed += 1
-                    reclaimed += size
-            except OSError:
-                continue
-        if images_removed:
-            removed.append(f"{images_removed} cached image(s)")
+    # Age alone cannot prove a shared screenshot is unused. Normal purge deletes
+    # owned images; legacy pruning belongs to explicit idle maintenance.
+    warnings = (
+        ["shared image pruning deferred; use artemis trace maintenance while idle"]
+        if prune_images_older_than > 0
+        else []
+    )
 
     summary = {
         "status": "purged" if removed else "nothing_removed",
         "session_id": session_id,
+        "cleanup_status": "partial" if errors and removed else "failed" if errors else "complete",
+        "diagnostics": diagnostics,
+        "warnings": warnings,
         "bytes_reclaimed": reclaimed,
         "removed": removed,
         "errors": errors,
@@ -288,3 +284,42 @@ def purge_trace(
 
     if not removed:
         raise typer.Exit(1)
+
+
+@trace_app.command("maintenance")
+def maintain_traces(
+    traces_path: Annotated[Path | None, typer.Option("--path", "-p")] = None,
+    compact: Annotated[
+        bool,
+        typer.Option(
+            "--compact", help="Also VACUUM; requires twice the database size in free space."
+        ),
+    ] = False,
+    image_min_age_s: Annotated[float, typer.Option("--image-min-age-s", min=0)] = 21600,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Remove legacy orphan rows/images only when Artemis is idle."""
+    from artemis.data_engine.retention import storage_diagnostics
+    from artemis.data_engine.storage import StorageManager
+
+    base = (traces_path or Path(settings.TRACES_PATH)).resolve()
+    database = base / "data_engine.db" if traces_path is not None else settings.DATA_ENGINE_DB_PATH
+    if not database.is_file():
+        typer.echo(json.dumps({"status": "rejected", "error": "database does not exist"}))
+        raise typer.Exit(2)
+    try:
+        # Schema migration also happens under the exclusive idle lease.
+        storage = StorageManager(database, base, initialize=False)
+        result = {
+            "status": "complete",
+            **storage.maintain(compact=compact, image_min_age_s=image_min_age_s),
+        }
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+        result = {
+            "status": "failed",
+            "error": str(exc),
+            "diagnostics": storage_diagnostics(database, exc),
+        }
+        typer.echo(json.dumps(result) if as_json else str(result))
+        raise typer.Exit(1)
+    typer.echo(json.dumps(result) if as_json else str(result))

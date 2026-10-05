@@ -244,6 +244,34 @@ def _ensure_maestro_not_installed(device_id: str) -> None:
         _uninstall_package(device_id, MAESTRO_PACKAGE)
 
 
+def _release_stale_poco(device_id: str) -> bool:
+    """Bound recovery to Poco instrumentation on this device, never a global adb reset."""
+    try:
+        for package in ("com.netease.open.pocoservice", "com.netease.open.pocoservice.test"):
+            subprocess.run(
+                adb_command(["-s", device_id, "shell", "am", "force-stop", package]),
+                capture_output=True,
+                timeout=3,
+                check=True,
+            )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                adb_command(["-s", device_id, "shell", "ps", "-A"]),
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=True,
+            )
+            if result.stdout.strip() and "pocoservice" not in result.stdout:
+                time.sleep(0.5)  # Android unregisters UiAutomation asynchronously
+                return True
+            time.sleep(0.2)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return False
+
+
 class UIAutomatorClient:
     """UIAutomator2 client for Android screen data retrieval.
 
@@ -277,7 +305,7 @@ class UIAutomatorClient:
                 return self._device
             except Exception:
                 logger.warning("UIAutomator2 connection lost, reconnecting...")
-                self._device = None
+                self.disconnect()
 
         # Ensure Maestro is not blocking us
         _ensure_maestro_not_installed(self._device_id)
@@ -302,6 +330,11 @@ class UIAutomatorClient:
                     f"UIAutomator2 connect attempt {attempt + 1}/3 to"
                     f" {self._device_id} failed: {exc}"
                 )
+                if attempt == 0 and "already registered" in str(exc):
+                    if not _release_stale_poco(self._device_id):
+                        raise RuntimeError(
+                            "UiAutomation remains occupied after bounded Poco teardown"
+                        ) from exc
         else:
             self._awake_strategy = None
             raise last_error
@@ -449,7 +482,12 @@ class UIAutomatorClient:
     def disconnect(self) -> None:
         """Disconnect this client without ending the host's awake lifetime."""
         self._awake_strategy = None
-        self._device = None
+        device, self._device = self._device, None
+        if device is not None:
+            try:
+                device.stop_uiautomator(wait=True)
+            except Exception as exc:
+                logger.warning(f"Could not stop owned UIAutomator server: {exc}")
         logger.info("UIAutomator2 client disconnected")
 
 

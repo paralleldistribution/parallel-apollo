@@ -74,3 +74,35 @@ async def test_android_driver_disconnect_cleans_up_ui_client():
     await driver.disconnect()
 
     ui_client.disconnect.assert_called_once_with()
+
+
+@patch("artemis.clients.ui_automator_client.time.sleep")
+@patch("artemis.clients.ui_automator_client._release_stale_poco", return_value=True)
+@patch("artemis.clients.ui_automator_client.ensure_device_awake")
+@patch("artemis.clients.ui_automator_client._ensure_maestro_not_installed")
+def test_registered_automation_is_released_before_retry(_maestro, _awake, release, _sleep):
+    device = MagicMock()
+    with patch(
+        "artemis.clients.ui_automator_client.u2.connect",
+        side_effect=[RuntimeError("UiAutomationService already registered!"), device],
+    ) as connect:
+        client = UIAutomatorClient("device-123")
+        client.connect()
+        assert connect.call_count == 2
+        release.assert_called_once_with("device-123")
+        client.disconnect()
+        client.disconnect()
+        device.stop_uiautomator.assert_called_once_with(wait=True)
+
+
+@patch("artemis.clients.ui_automator_client._release_stale_poco", return_value=False)
+@patch("artemis.clients.ui_automator_client.ensure_device_awake")
+@patch("artemis.clients.ui_automator_client._ensure_maestro_not_installed")
+def test_occupied_automation_never_retries_until_release(_maestro, _awake, release):
+    with patch(
+        "artemis.clients.ui_automator_client.u2.connect",
+        side_effect=RuntimeError("already registered"),
+    ) as connect:
+        with pytest.raises(RuntimeError, match="remains occupied"):
+            UIAutomatorClient("device-123").connect()
+        connect.assert_called_once()
