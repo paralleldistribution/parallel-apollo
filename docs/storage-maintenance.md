@@ -8,8 +8,11 @@ sizes, free space and page counts. A missing database is rejected without creati
 one. If initialization or a liveness check fails, artifacts are preserved. After
 inactivity is verified, storage may still reclaim that session's own files if a later
 SQL deletion fails; caller-supplied compiled paths are retained on database failure.
-The summary includes files already reclaimed by storage, with `cleanup_status=partial`
-and exit code zero when anything was removed, even if the SQL transaction failed.
+Storage and CLI file deletion share a per-command report populated only after a
+deletion succeeds. The summary includes those confirmed removals, with
+`cleanup_status=partial` and exit code zero when anything was removed, even if the
+SQL transaction failed. Files disappearing during another cleanup do not turn a
+failed purge into success or contribute to its reclaimed-byte count.
 Inspect `cleanup_status` and `errors`; exit code zero alone does not mean database
 rows were deleted. Already-missing paths do not count as reclaimed artifacts.
 

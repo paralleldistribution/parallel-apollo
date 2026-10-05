@@ -26,6 +26,7 @@ from typing import Any
 import uuid
 from uuid import UUID
 
+from artemis.data_engine.artifact_cleanup import ArtifactCleanupReport
 from artemis.data_engine.models import (
     BackgroundTaskRecord,
     FailedOutputRecord,
@@ -1248,14 +1249,19 @@ class StorageManager:
         except psutil.AccessDenied:
             return True
 
-    def delete_session(self, session_id: UUID):
+    def delete_session(
+        self, session_id: UUID, *, cleanup_report: ArtifactCleanupReport | None = None
+    ):
         """Delete one inactive session without compacting the shared database.
 
         All SQL deletions commit together. Once liveness has been checked inside
         the transaction, file cleanup can run even if subsequent SQL fails;
         failure is propagated so callers cannot report a successful database
-        purge after silently skipping tables.
+        purge after silently skipping tables. An optional per-call report records
+        successful artifact deletions even if this method raises afterward.
         """
+        if cleanup_report is None:
+            cleanup_report = ArtifactCleanupReport()
         session_id_str = str(UUID(str(session_id)))
         video_paths = []
         with self._get_connection() as conn:
@@ -1332,13 +1338,19 @@ class StorageManager:
         finally:
             if allow_file_cleanup:
                 file_errors = self._delete_session_files(
-                    session_id_str, video_paths, other_video_paths
+                    session_id_str, video_paths, other_video_paths, cleanup_report
                 )
         if file_errors:
             raise OSError("session artifact cleanup incomplete: " + "; ".join(file_errors))
         logger.info(f"Database records for session {session_id} cleared (no VACUUM).")
 
-    def _delete_session_files(self, session_id: str, video_paths: list[Path], protected: set[str]):
+    def _delete_session_files(
+        self,
+        session_id: str,
+        video_paths: list[Path],
+        protected: set[str],
+        cleanup_report: ArtifactCleanupReport,
+    ):
         base = self.base_trace_dir.resolve()
         targets = {base / session_id}
         for video in video_paths:
@@ -1363,10 +1375,7 @@ class StorageManager:
             try:
                 if path.is_symlink() or path.resolve().parent != base:
                     raise ValueError(f"refusing unsafe artifact path: {path}")
-                if path.is_dir():
-                    shutil.rmtree(path)
-                elif path.exists():
-                    path.unlink()
+                cleanup_report.remove(path)
             except (OSError, ValueError) as exc:
                 errors.append(str(exc))
         if errors:

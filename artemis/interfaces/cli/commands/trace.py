@@ -17,7 +17,6 @@
 import datetime
 import json
 from pathlib import Path
-import shutil
 import sqlite3
 import time
 from typing import Annotated
@@ -115,22 +114,6 @@ def view_trace(
         typer.echo(f"  - {f.name}")
 
 
-def _dir_size(path: Path) -> int:
-    """Total bytes under a path (0 when it is missing)."""
-    if not path.exists():
-        return 0
-    if path.is_file():
-        return path.stat().st_size
-    total = 0
-    for child in path.rglob("*"):
-        try:
-            if child.is_file():
-                total += child.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
 def _is_within(child: Path, parent: Path) -> bool:
     """Whether `child` resolves to something inside `parent`.
 
@@ -188,6 +171,7 @@ def purge_trace(
     Exits non-zero only if nothing could be removed at all, so a caller can treat
     a partial purge as success and still reclaim the bulk of the space.
     """
+    from artemis.data_engine.artifact_cleanup import ArtifactCleanupReport
     from artemis.data_engine.storage import StorageManager
 
     from artemis.data_engine.retention import ActiveSessionError, storage_diagnostics
@@ -202,7 +186,6 @@ def purge_trace(
         typer.echo(json.dumps({"status": "rejected", "error": "session_id must be a UUID"}))
         raise typer.Exit(2)
     diagnostics = []
-    reclaimed = 0
     removed: list[str] = []
     errors: list[str] = []
 
@@ -219,7 +202,6 @@ def purge_trace(
         typer.echo(json.dumps({"status": "rejected", "error": message}) if as_json else message)
         raise typer.Exit(2)
 
-    # Measure before deleting: the sizes are gone afterwards.
     session_dir = base_dir / session_id
     targets = [session_dir]
     if trace_dir is not None:
@@ -229,14 +211,14 @@ def purge_trace(
         base_dir / f"{session_id}.artemis.log",
     ]
     targets.extend(leftovers)
-    planned = {str(t): _dir_size(t) for t in targets if t.exists()}
+    cleanup_report = ArtifactCleanupReport()
 
     # Only successful session deletion proves the caller's extra artifact paths
     # can be reclaimed. Initialization/read failures must not bypass liveness.
     artifacts_verified = False
     try:
         storage = StorageManager(database, base_dir)
-        storage.delete_session(UUID(session_id))
+        storage.delete_session(UUID(session_id), cleanup_report=cleanup_report)
         removed.append("database rows")
         artifacts_verified = True
     except ActiveSessionError as exc:
@@ -252,23 +234,13 @@ def purge_trace(
         try:
             if target.is_symlink() or target.resolve().parent != base_dir:
                 raise ValueError(f"refusing unsafe artifact path: {target}")
-            if target.is_dir():
-                shutil.rmtree(target)
-                removed.append(str(target))
-            elif target.exists():
-                target.unlink()
-                removed.append(str(target))
+            cleanup_report.remove(target)
         except (OSError, ValueError) as exc:
             errors.append(f"could not delete {target}: {exc!r}")
-    # delete_session can remove its verified-inactive files even when later SQL
-    # fails. Reconcile those removals before choosing status/exit code, without
-    # treating already-missing paths as work or authorizing further deletion.
-    for path, size in planned.items():
-        target = Path(path)
-        if not target.exists() and not target.is_symlink():
-            reclaimed += size
-            if path not in removed:
-                removed.append(path)
+    # Storage records successful deletions before propagating a later error.
+    # Another cleanup's removals cannot turn this purge's failure into success.
+    removed.extend(cleanup_report.removed)
+    reclaimed = cleanup_report.bytes_reclaimed
     # Age alone cannot prove a shared screenshot is unused. Normal purge deletes
     # owned images; legacy pruning belongs to explicit idle maintenance.
     warnings = (

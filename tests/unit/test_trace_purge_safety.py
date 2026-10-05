@@ -2,7 +2,9 @@
 
 import json
 import os
+import shutil
 import sqlite3
+import threading
 import time
 from uuid import uuid4
 
@@ -123,6 +125,67 @@ def test_late_sql_failure_reports_files_reclaimed_by_storage(run_artifacts, sess
             conn.execute("SELECT status FROM sessions WHERE session_id=?", (sid,)).fetchone()[0]
             == "completed"
         )
+
+
+@pytest.mark.parametrize("failure_stage", ["initialization", "liveness_read", "artifact_cleanup"])
+@pytest.mark.parametrize("external_target", ["session", "compiled"])
+def test_concurrent_cleanup_is_not_credited_to_this_purge(
+    run_artifacts, monkeypatch, failure_stage, external_target
+):
+    storage, sid, compiled, paths = run_artifacts
+    session = storage.base_trace_dir / sid
+    with storage._get_connection() as conn:
+        conn.execute("UPDATE sessions SET status='completed' WHERE session_id=?", (sid,))
+        conn.execute(
+            "CREATE TRIGGER block_session_delete BEFORE DELETE ON sessions "
+            "BEGIN SELECT RAISE(ABORT,'injected SQL failure'); END"
+        )
+        conn.commit()
+
+    original_cleanup = StorageManager._delete_session_files
+    other_target = session if external_target == "session" else compiled
+
+    def competing_cleanup_then_fail(*args, **kwargs):
+        other = threading.Thread(target=shutil.rmtree, args=(other_target,))
+        other.start()
+        other.join(2)
+        assert not other.is_alive() and not other_target.exists()
+        if failure_stage == "artifact_cleanup":
+            return original_cleanup(*args, **kwargs)
+        raise sqlite3.OperationalError("injected failure before cleanup")
+
+    method = {
+        "initialization": "_init_db",
+        "liveness_read": "_session_is_active",
+        "artifact_cleanup": "_delete_session_files",
+    }[failure_stage]
+    monkeypatch.setattr(StorageManager, method, competing_cleanup_then_fail)
+    result = CliRunner().invoke(
+        trace_app,
+        [
+            "purge",
+            sid,
+            "--path",
+            str(storage.base_trace_dir),
+            "--trace-dir",
+            str(compiled),
+            "--json",
+        ],
+    )
+    removed_session = failure_stage == "artifact_cleanup" and external_target == "compiled"
+    assert result.exit_code == (0 if removed_session else 1), result.output
+    summary = json.loads(result.stdout.splitlines()[-1])
+    assert summary["status"] == ("purged" if removed_session else "nothing_removed")
+    assert summary["cleanup_status"] == ("partial" if removed_session else "failed")
+    assert summary["removed"] == ([str(session)] if removed_session else [])
+    assert summary["bytes_reclaimed"] == (len(b"active evidence") if removed_session else 0)
+    assert "injected" in summary["errors"][0]
+    assert not other_target.exists()  # Never credit this other actor's removal.
+    assert all(path.read_bytes() == b"active evidence" for path in paths[2:])
+    if external_target == "session":
+        assert paths[1].read_bytes() == b"active evidence"
+    elif not removed_session:
+        assert paths[0].read_bytes() == b"active evidence"
 
 
 def test_missing_derived_database_is_rejected_without_creating_or_deleting_files(
